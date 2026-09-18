@@ -43,15 +43,24 @@ def _dump_devices(inst, sc, placed, grid):
     return out
 
 
-def _route(inst, placed, keepout, log):
+def _route(inst, placed, keepout, log, eq_keepout=()):
     """给定设备位置 → 布管 → 独立校验。返回一份结果片段。"""
     blocks, nets, P, sol = build.device_level(inst, placed)
+    eq_viol = []
+    if eq_keepout and inst["P"]["routing"]["constraints"]["equipment_keepout"]["enabled"]:
+        g = P["grid"]
+        for b, s in zip(blocks, sol):
+            p = b["poses"][0]
+            x0, y0, x1, y1 = s["x"] * g, s["y"] * g, (s["x"] + p["W"]) * g, (s["y"] + p["H"]) * g
+            if any(x0 < k[2] and k[0] < x1 and y0 < k[3] and k[1] < y1 for k in eq_keepout):
+                eq_viol.append(f"设备 {b['id']} 位于设备禁区内")
     lb = base.validate(blocks, nets, P, sol, P["w"], "v2")
     sc = build.scene(inst, blocks, nets, P, sol, keepout)
     t0 = time.time()
     routes, history, _G = rt.negotiate(sc, log=log)
     route_s = time.time() - t0
     viol, met = rt.check_routes(sc, routes)
+    viol = eq_viol + viol
     failed = history[-1]["failed"]
     ok = not viol and len(routes) == len(sc.nets)
     return {"ok": ok, "violations": viol, "unrouted": failed,
@@ -74,7 +83,7 @@ def solve(case, log=None, work_dir=None):
         placed = {d["id"]: (d["placed"][0] // grid, d["placed"][1] // grid, d["placed"][2])
                   for d in case["devices"]}
         log(f"只布管：{len(placed)} 台设备、{len(inst['nets'])} 个管网")
-        out = _route(inst, placed, keepout, log)
+        out = _route(inst, placed, keepout, log, task["equipment_keepout"])
         out.update(mode="route_only", candidates=[], total_s=round(time.time() - t_all, 1))
         return out
 
@@ -92,13 +101,15 @@ def solve(case, log=None, work_dir=None):
     for k in range(task["candidates"]):
         seed = task["seed"] + k
         t0 = time.time()
-        r = sp.run(bpath, task["time_budget_s"], task["workers"], seed, margins=margins)
+        eq = [tuple(c // grid for c in r_) for r_ in task["equipment_keepout"]] \
+            if inst["P"]["routing"]["constraints"]["equipment_keepout"]["enabled"] else None
+        r = sp.run(bpath, task["time_budget_s"], task["workers"], seed, margins=margins, keepout=eq)
         if r["solution"] is None:
             log(f"  候选 {k}（种子 {seed}）：摆放没有找到可行解")
             cands.append({"seed": seed, "ok": False, "reason": "摆放无可行解"})
             continue
         placed = build.expand(inst, modules, bdata, base.load(bpath)[0], r["solution"])
-        one = _route(inst, placed, keepout, lambda _l: None)
+        one = _route(inst, placed, keepout, lambda _l: None, task["equipment_keepout"])
         one["placement_s"] = round(time.time() - t0 - one["route_s"], 1)
         m = one["metrics"]
         state = "无违规" if one["ok"] else f"违规 {len(one['violations'])}"

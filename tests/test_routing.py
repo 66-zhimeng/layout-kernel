@@ -20,7 +20,9 @@ def cons(K=1, z_max=3000, zone=2000, gap=100, skip=0):
             "low_pipes": {"enabled": False},
             "junction_merge_exemption": {"enabled": True},
             "internal_spools": {"enabled": True},
-            "equipment_spacing": {"enabled": False}}
+            "equipment_spacing": {"enabled": False},
+            "equipment_keepout": {"enabled": False},
+            "pipe_keepout": {"enabled": True}}
 
 
 RP = {"D_default_mm": 200, "c_rho": 1.5, "eps_z_mm": 1, "constraints": cons(),
@@ -303,3 +305,25 @@ def test_coarse_missing_param_raises():
     sc = scene(two_facing(), [{"id": "n", "terms": [("A", "p"), ("B", "q")]}])
     with pytest.raises(KeyError, match="coarse_cell_mm"):
         cr.coarse_route(sc)
+
+
+def test_per_pipe_weight_scales_objective():
+    """单根管的权重倍数进入目标：管长权重翻倍，J 正好多出一份管长项。"""
+    dev = two_facing(gap=3000)
+    route = {"n": [{"start": ("A", "p"), "end": ("port", ("B", "q")), "points": [(1000, 500, 500), (4000, 500, 500)]}]}
+    base = rt.Scene(dev, [{"id": "n", "terms": [("A", "p"), ("B", "q")]}], RP, W, SCALE)
+    heavy = rt.Scene(dev, [{"id": "n", "terms": [("A", "p"), ("B", "q")], "weight_length": 2}], RP, W, SCALE)
+    j1, j2 = rt.check_routes(base, route)[1]["J"], rt.check_routes(heavy, route)[1]["J"]
+    assert abs((j2 - j1) - W["length"] * 3000 / SCALE["L0"]) < 1e-3
+
+
+def test_pipe_keepout_is_avoided_and_checked():
+    """管道禁区挡住直连：布管绕开；把直连路径交给校验器会被报出。"""
+    dev = two_facing(gap=4000)
+    nets = [{"id": "n", "terms": [("A", "p"), ("B", "q")]}]
+    zone = [(2500, 0, 0, 3500, 1000, 3000)]
+    sc = rt.Scene(dev, nets, RP, W, SCALE, pipe_keepout=zone)
+    routes, _ = route_one(sc)
+    assert rt.check_routes(sc, routes)[0] == [] and len(routes["n"][0]["points"]) > 2
+    straight = {"n": [{"start": ("A", "p"), "end": ("port", ("B", "q")), "points": [(1000, 500, 500), (5000, 500, 500)]}]}
+    assert any("管道禁区" in v for v in rt.check_routes(sc, straight)[0])

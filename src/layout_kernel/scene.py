@@ -153,6 +153,7 @@ def build_scene(inp, settings, fixed_ids=(), deltas=None):
         ka, kb = r["from"]["key"], r["to"]["key"]
         net = {"id": r["id"], "terms": [(port_owner[ka], ka), (port_owner[kb], kb)],
                "D_mm": round(D, 1), "rho_mm": rho, "lead_mm": lmin,
+               **{k: r[k] for k in ("weight_length", "weight_bends", "weight_height_changes") if k in r},
                "port_straight_mm": {k_: v for k_, v in ((ka, ps_a), (kb, ps_b)) if k_ not in stubs}}
         if r.get("low") and cons_cfg["low_pipes"]["enabled"]:
             net["zc_max_mm"] = cons_cfg["low_pipes"]["zc_max_mm"]
@@ -171,16 +172,26 @@ def build_scene(inp, settings, fixed_ids=(), deltas=None):
                            "points": [to_k([p_[i] + d[i] for i in range(3)]), to_k([q_[i] + d[i] for i in range(3)])]})
     # 并行进程各自要建一遍网格：管少时并行不划算，按每进程至少 SERIAL_NETS 根管分配
     rp["route_workers"] = max(1, min(rp["route_workers"], len(nets) // SERIAL_NETS))
-    sc = rt.Scene(devices, nets, rp, settings["weights"], settings["scale"], fixed, spools)
+    pipe_keepout = [_box_k({"min": b[:3], "max": b[3:]}) for b in inp.get("pipe_keepout", [])]
+    sc = rt.Scene(devices, nets, rp, settings["weights"], settings["scale"], fixed, spools, pipe_keepout)
+    sc.equipment_keepout = [_box_k({"min": b[:3], "max": b[3:]}) for b in inp.get("equipment_keepout", [])]
     return sc, {"stubs": stubs, "port_w": port_w, "meta": meta}
 
 
 def _moved_violations(sc, deltas):
     """equipment_spacing：被移动设备的包围盒与其他设备的间距，及与固定管道（不参与本次布管）的净距。"""
-    c = sc.cons["equipment_spacing"]
-    if not deltas or not c["enabled"]:
+    if not deltas:
         return []
     out = []
+    if sc.cons["equipment_keepout"]["enabled"]:
+        for nid in deltas:                                              # 设备禁区：无盒节点按端口外接盒
+            d = sc.dev[nid]
+            b = d["box"] or tuple(f(v[i] for v in d["ports"].values()) for f in (min, max) for i in range(3))
+            if any(rt._gap(b, k) < -1e-6 for k in sc.equipment_keepout):
+                out.append(f"移动后 {nid} 进入设备禁区")
+    c = sc.cons["equipment_spacing"]
+    if not c["enabled"]:
+        return out
     boxes = {did: d["box"] for did, d in sc.dev.items() if d["box"] is not None}
     for nid in deltas:
         b = boxes.get(nid)
@@ -207,9 +218,7 @@ def _route_once(inp, settings, fixed_ids=(), deltas=None, log=None):
     routes, history, G = rt.negotiate(sc, log=log or (lambda _l: None))
     viol, met = rt.check_routes(sc, routes)
     ok = not viol and len(routes) == len(sc.nets)
-    w, s_ = sc.w, sc.scale
-    cost = sum(w["length"] * v["L_mm"] / s_["L0"] + w["bends"] * v["bends"] / s_["B0"]
-               + w["height_changes"] * v["height_changes"] / s_["C0"] for v in met["per_net"].values())
+    cost = sum(rt.net_cost(sc, nid, v) for nid, v in met["per_net"].items())
     return {"sc": sc, "meta": meta, "routes": routes, "viol": viol, "met": met, "ok": ok,
             "cost": cost if ok else math.inf, "history": history, "G": G}
 
@@ -352,9 +361,7 @@ def _candidates(inp, meta0, movable, radius_m):
 
 def _net_costs(r):
     """每根重布管的代价（与 _route_once 的总代价同一口径）。"""
-    w, s_ = r["sc"].w, r["sc"].scale
-    return {nid: w["length"] * v["L_mm"] / s_["L0"] + w["bends"] * v["bends"] / s_["B0"]
-            + w["height_changes"] * v["height_changes"] / s_["C0"] for nid, v in r["met"]["per_net"].items()}
+    return {nid: rt.net_cost(r["sc"], nid, v) for nid, v in r["met"]["per_net"].items()}
 
 
 def optimize_scene(inp, settings, log=None):

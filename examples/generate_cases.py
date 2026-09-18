@@ -87,6 +87,8 @@ PARAMS = {
             "junction_merge_exemption": {"enabled": True},                       # 汇合于同一三通的管在口附近不算冲突
             "internal_spools":          {"enabled": True},                       # 三通内部短管是其他管的障碍
             "equipment_spacing":        {"enabled": True, "gap_mm": 800},        # 移动设备时的设备间距
+            "equipment_keepout":        {"enabled": True},                       # 设备禁区（任务书 equipment_keepout 给出区域）
+            "pipe_keepout":             {"enabled": True},                       # 管道禁区（任务书 keepout 给出区域）
         },
         "pitch_mm": 300,                         # 布管轨道线基础间距
         "margin_mm": 1500,                       # 布管区域在设备外接矩形外的扩展

@@ -103,4 +103,12 @@ def validate_case(case):
         if missing:
             raise CaseError(f"route_only 模式下每台设备都要给 placed（缺：{missing}）")
     keepout = [_box(b, f"keepout[{i}]") for i, b in enumerate(case.get("keepout", []))]
+    eq = []
+    for i, r in enumerate(case.get("equipment_keepout", [])):
+        if not (isinstance(r, (list, tuple)) and len(r) == 4 and r[0] < r[2] and r[1] < r[3]):
+            raise CaseError(f"equipment_keepout[{i}]：应为平面矩形 [x0,y0,x1,y1]（mm），且下界小于上界，实际为 {r!r}")
+        if any(c % grid for c in r):
+            raise CaseError(f"equipment_keepout[{i}]：坐标须为网格 {grid} mm 的整数倍，实际为 {r!r}")
+        eq.append(tuple(r))
+    task = {**task, "equipment_keepout": eq}
     return inst, task, keepout

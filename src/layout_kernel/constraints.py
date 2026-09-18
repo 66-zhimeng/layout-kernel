@@ -13,7 +13,9 @@
       "low_pipes":                {"enabled": true,  "zc_max_mm": 3199.9},
       "junction_merge_exemption": {"enabled": true},
       "internal_spools":          {"enabled": true},
-      "equipment_spacing":        {"enabled": true,  "gap_mm": 120}
+      "equipment_spacing":        {"enabled": true,  "gap_mm": 120},
+      "equipment_keepout":        {"enabled": false},
+      "pipe_keepout":             {"enabled": false}
     }
 
 关闭（enabled=false）时只需写 enabled；打开时必须给出该约束的全部参数。未知的约束名直接报错，防止拼写错误被静默忽略。
@@ -60,6 +62,16 @@ REGISTRY = {
     },
     "internal_spools": {
         "doc": "节点内部短管（三通内的接管等）对其他管是障碍；接在该节点上的管只豁免首段与末段。",
+        "params": {},
+    },
+    "equipment_keepout": {
+        "doc": "设备不得进入的区域（区域本身作为输入数据给出：任务书 equipment_keepout 为平面矩形，场景接口 "
+               "equipment_keepout 为三维盒）。摆放搜索中碰到禁区的方案判为不可行；场景接口移动 / 旋转设备时同样检查。",
+        "params": {},
+    },
+    "pipe_keepout": {
+        "doc": "管道不得进入的区域（区域作为输入数据给出：任务书 keepout、场景接口 pipe_keepout，均为三维盒）。"
+               "布管时作为障碍，校验时检查。",
         "params": {},
     },
     "equipment_spacing": {

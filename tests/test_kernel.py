@@ -27,7 +27,9 @@ CONSTRAINTS = {"pipe_pipe_clearance": {"enabled": True, "gap_mm": 100},
                "low_pipes": {"enabled": False},
                "junction_merge_exemption": {"enabled": True},
                "internal_spools": {"enabled": True},
-               "equipment_spacing": {"enabled": False}}
+               "equipment_spacing": {"enabled": False},
+               "equipment_keepout": {"enabled": True},
+               "pipe_keepout": {"enabled": True}}
 ROUTING = {"D_default_mm": 200, "c_rho": 1.5, "eps_z_mm": 1, "constraints": CONSTRAINTS, "pitch_mm": 300, "margin_mm": 1500,
            "max_iters": 20, "pres_fac_init": 0.5, "pres_fac_mult": 1.6, "hist_fac": 0.5,
            "max_expansions": 300000, "astar_weight": 1.5, "route_workers": 1, "stall_iters": 6,
@@ -134,3 +136,26 @@ def test_route_only_requires_all_positions():
 def test_result_is_json_serializable():
     r = solve(case(time_budget_s=2, candidates=1, workers=1))
     json.dumps(r, ensure_ascii=False)
+
+
+def test_equipment_keepout_rejects_overlapping_placement():
+    """设备禁区：与禁区重叠的摆放在搜索中判为不可行。"""
+    from layout_kernel import placement_sp as sp
+    blocks = [{"poses": [{"W": 10, "H": 10}]}, {"poses": [{"W": 5, "H": 5}]}]
+    pr = type("P", (), {})()
+    pr.blocks, pr.keepout = blocks, [(20, 20, 30, 30)]
+    assert sp._in_keepout(pr, [{"x": 0, "y": 0, "pose": 0}, {"x": 22, "y": 22, "pose": 0}])
+    assert not sp._in_keepout(pr, [{"x": 0, "y": 0, "pose": 0}, {"x": 30, "y": 22, "pose": 0}])     # 贴边不算重叠
+
+
+def test_equipment_keepout_in_route_only_is_reported():
+    r = solve(case(time_budget_s=2, candidates=1, workers=1))
+    c = copy.deepcopy(CASE)
+    for d in c["devices"]:
+        v = r["devices"][d["id"]]
+        d["placed"] = [v["x_mm"], v["y_mm"], v["rot_deg"]]
+    c["task"] = {"mode": "route_only"}
+    v = r["devices"]["泵1"]
+    c["equipment_keepout"] = [[v["x_mm"], v["y_mm"], v["x_mm"] + 100, v["y_mm"] + 100]]
+    r2 = solve(c)
+    assert not r2["ok"] and any("设备禁区" in x for x in r2["violations"])

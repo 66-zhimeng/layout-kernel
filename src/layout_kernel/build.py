@@ -65,10 +65,8 @@ def scene(inst, blocks, nets, P, sol, keepout=()):
     nets_r = [{"id": e["id"], "terms": [(blocks[i]["id"], pn) for i, pn in e["terms"]]} for e in nets]
     scale = {"A0": P["A0"] * grid ** 2, "L0": P["L0"] * grid, "B0": P["B0"], "C0": len(nets),
              "kappa": P["kappa"], "l_min_mm": P["lmin"] * grid}
-    sc = rt.Scene(devices, nets_r, inst["P"]["routing"], inst["P"]["weights"], scale)
-    for box in keepout:
-        sc.boxes.append((*box, 0.0, None))                     # 禁区按给定尺寸，不再膨胀
-    return sc
+    # 管道禁区是否生效由约束 pipe_keepout 决定（见 constraints.py）
+    return rt.Scene(devices, nets_r, inst["P"]["routing"], inst["P"]["weights"], scale, pipe_keepout=keepout)
 
 
 def placement_margins(rp):

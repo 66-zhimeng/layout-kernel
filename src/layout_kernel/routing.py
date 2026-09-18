@@ -63,11 +63,13 @@ class Scene:
     nets: [{"id", "terms": [(dev, port)], 可选 "D_mm"、"rho_mm"、"lead_mm"、"zc_max_mm"}]；单位 mm。
       D_mm 管外径（缺省 D_default_mm）；rho_mm 弯曲半径（缺省 c_rho × D）；
       lead_mm 端口处直颈 + 变径所需直管（与 ℓ_min 取大）；zc_max_mm 管中心线最高标高（缺省只受 z_max_mm 限制）；
-      port_straight_mm {端口名: 从该端口到第一个弯头所需直管}（缺省 rho + lmin；两端直颈不同时分别给出）。
+      port_straight_mm {端口名: 从该端口到第一个弯头所需直管}（缺省 rho + lmin；两端直颈不同时分别给出）；
+      weight_length / weight_bends / weight_height_changes：本管在目标中的权重倍数（乘在全局权重上；不给即 1，
+      例如主管更贵就把 weight_bends 调大，让它尽量走直）。
     fixed_routes: {id: {"points": [[x,y,z], ...], "D_mm"}}：不参与布管的已有管道（锁定管、局部优化范围外的管、
       三通内部短管），作为硬障碍，并参与管—管净距校验。允许斜段（按包围盒保守处理）。"""
 
-    def __init__(self, devices, nets, rp, weights, scale, fixed_routes=None, spools=None):
+    def __init__(self, devices, nets, rp, weights, scale, fixed_routes=None, spools=None, pipe_keepout=None):
         check_params(rp, weights)
         self.dev, self.nets, self.rp, self.w = devices, nets, rp, weights
         self.fixed_routes = fixed_routes or {}
@@ -94,6 +96,9 @@ class Scene:
         self.np = {}                                            # 每根管的参数
         for n in nets:
             D = n.get("D_mm", D0)
+            for k in ("weight_length", "weight_bends", "weight_height_changes"):
+                if k in n and (not isinstance(n[k], (int, float)) or n[k] < 0):
+                    raise ValueError(f"管 {n['id']} 的 {k} 必须是非负数")
             top = (self.z_ceiling - D / 2) if self.z_ceiling is not None else math.inf
             zc = min(top, n.get("zc_max_mm", math.inf))
             if self.straight_on:
@@ -103,6 +108,8 @@ class Scene:
                                                       for dev, pn in n["terms"] if pn in n.get("port_straight_mm", {})}}
             else:                                                       # 不限直管长度：只要求正交
                 self.np[n["id"]] = {"D": D, "rho": 0.0, "lmin": 0.0, "zc_max": zc, "port_straight": {}}
+            self.np[n["id"]].update(wl=float(n.get("weight_length", 1.0)), wb=float(n.get("weight_bends", 1.0)),
+                                    wc=float(n.get("weight_height_changes", 1.0)))
         # 包络管径：障碍膨胀、占用晕、网格线都按最大管径取，保守
         self.D = max([D0] + [v["D"] for v in self.np.values()] + [f["D_mm"] for f in self.fixed_routes.values()])
         self.rho = rp["c_rho"] * D0
@@ -115,6 +122,10 @@ class Scene:
             if self.zone_h is not None:
                 for zx0, zy0, zx1, zy1 in d["zones"]:
                     self.boxes.append((zx0, zy0, 0, zx1, zy1, self.zone_h, self.D / 2, None))
+        # 管道禁区（pipe_keepout 约束打开时生效）：管外壁不得进入，按最大管半径膨胀
+        self.pipe_keepout = [tuple(b) for b in (pipe_keepout or [])] if c["pipe_keepout"]["enabled"] else []
+        for b in self.pipe_keepout:
+            self.boxes.append((*b, self.D / 2, None))
 
     def net_param(self, nid):
         return self.np[nid]
@@ -295,9 +306,9 @@ def tree_heuristic(G, segs, cL):
 def astar(G, sc, start, target, ctx):
     """编译实现（astar_fast.search）。规则与 astar_py 相同，测试中逐例比对。
     start = (dev, port)；target = ("port", (dev, port)) 或 ("tree", tree)。返回 (折线点列表, 结束信息) 或 None。"""
-    cL = sc.w["length"] / sc.scale["L0"]
-    cB = sc.w["bends"] / sc.scale["B0"]
-    cC = sc.w["height_changes"] / sc.scale["C0"]
+    cL = sc.w["length"] / sc.scale["L0"] * ctx.get("wl", 1.0)          # 本管权重倍数
+    cB = sc.w["bends"] / sc.scale["B0"] * ctx.get("wb", 1.0)
+    cC = sc.w["height_changes"] / sc.scale["C0"] * ctx.get("wc", 1.0)
     halo, hist = ctx["halo"], ctx["hist"]
     ha = halo if isinstance(halo, np.ndarray) else np.zeros(G.size * 3, dtype=np.int32)
     hi_ = hist if isinstance(hist, np.ndarray) else np.zeros(G.size * 3, dtype=np.float32)
@@ -393,9 +404,9 @@ def astar_py(G, sc, start, target, ctx):
     start = (dev, port)；target = ("port", (dev, port)) 或 ("tree", tree)。返回 (折线点列表, 结束信息) 或 None。"""
     rho, lmin, K, zc_max = ctx["rho"], ctx["lmin"], sc.K, ctx["zc_max"]
     cap = 2 * rho + lmin                                           # 目标端要求更长时在下方放宽
-    cL = sc.w["length"] / sc.scale["L0"]
-    cB = sc.w["bends"] / sc.scale["B0"]
-    cC = sc.w["height_changes"] / sc.scale["C0"]
+    cL = sc.w["length"] / sc.scale["L0"] * ctx.get("wl", 1.0)          # 本管权重倍数
+    cB = sc.w["bends"] / sc.scale["B0"] * ctx.get("wb", 1.0)
+    cC = sc.w["height_changes"] / sc.scale["C0"] * ctx.get("wc", 1.0)
     halo, hist, pres = ctx["halo"], ctx["hist"], ctx["pres"]
     ex_nodes, ex_edges = ctx["ex_nodes"], ctx["ex_edges"]
     blocked, eblocked = G.blocked, G.eblocked
@@ -807,7 +818,7 @@ def _route_net(G, sc, net, ctx):
         return None, "端口正前方不足 ℓ_min：" + "、".join(f"{d}.{p}" for d, p in bad)
     ctx = {**ctx, "ex_nodes": ex_nodes, "ex_edges": ex_edges, "rho": npar["rho"], "lmin": npar["lmin"],
            "zc_max": npar["zc_max"], "self_clear": (npar["D"] + sc.gap_pp) if sc.self_on else 0.0, "inside": inside,
-           "port_straight": npar["port_straight"]}
+           "port_straight": npar["port_straight"], "wl": npar["wl"], "wb": npar["wb"], "wc": npar["wc"]}
     P = {t: sc.port(*t)[:3] for t in terms}
     man = lambda u, v: sum(abs(P[u][a] - P[v][a]) for a in range(3))
     if len(terms) == 2:
@@ -820,7 +831,7 @@ def _route_net(G, sc, net, ctx):
         return None, "搜索未找到路径（或超过扩展上限）"
     branches = [{"start": a, "points": r[0], "end": ("port", b)}]
     rest = [t for t in terms if t not in (a, b)]
-    cL = sc.w["length"] / sc.scale["L0"]
+    cL = sc.w["length"] / sc.scale["L0"] * npar["wl"]                 # 与 A* 同一口径的启发式系数
     hl = None
     while rest:
         tree = build_tree(G, branches, npar["rho"], npar["lmin"])
@@ -843,9 +854,9 @@ def _route_net(G, sc, net, ctx):
 _W = {}
 
 
-def _worker_init(devices, nets, rp, weights, scale, halo_name, hist_name, fixed_routes, spools):
+def _worker_init(devices, nets, rp, weights, scale, halo_name, hist_name, fixed_routes, spools, pipe_keepout):
     from multiprocessing import shared_memory
-    sc = Scene(devices, nets, rp, weights, scale, fixed_routes, spools)
+    sc = Scene(devices, nets, rp, weights, scale, fixed_routes, spools, pipe_keepout)
     _W["sc"], _W["G"] = sc, Grid(sc)
     _W["shm"] = (shared_memory.SharedMemory(name=halo_name), shared_memory.SharedMemory(name=hist_name))
     _W["halo"] = np.frombuffer(_W["shm"][0].buf, dtype=np.int32)
@@ -914,7 +925,7 @@ def negotiate(sc, log=print):
         hist = np.frombuffer(shms[1].buf, dtype=np.float32)
         ex = ProcessPoolExecutor(workers, mp_context=mp.get_context("spawn"), initializer=_worker_init,
                                  initargs=(sc.dev, sc.nets, rp, sc.w, sc.scale, shms[0].name, shms[1].name,
-                                           sc.fixed_routes, sc.spools))
+                                           sc.fixed_routes, sc.spools, sc.pipe_keepout))
         list(ex.map(_worker_ready, range(workers * 4)))                 # 预先启动全部工作进程
     else:
         halo, hist = np.zeros(size, dtype=np.int32), np.zeros(size, dtype=np.float32)
@@ -1242,6 +1253,9 @@ def check_routes(sc, routes):
                         zb = (zx0, zy0, 0, zx1, zy1, sc.zone_h)
                         if _gap(full, zb) < 0 - 1e-6:
                             viol.append(f"{nid}：管段 {p}→{q} 穿过 {did} 的检修区")
+                for kb in sc.pipe_keepout:
+                    if _gap(full, kb) < -1e-6:
+                        viol.append(f"{nid}：管段 {p}→{q} 进入管道禁区")
                 if (sc.z_ceiling is not None and full[5] > sc.z_ceiling + 1e-6) or max(p[2], q[2]) > npar["zc_max"] + 1e-6:
                     viol.append(f"{nid}：管段 {p}→{q} 超出高度范围")
         all_boxes.append((nid, [_box(p, q, D / 2) for br in brs for p, q in clash_segments(sc, br)]))
@@ -1288,11 +1302,17 @@ def check_routes(sc, routes):
     Bt = sum(v["bends"] for v in per_net.values())
     Ct = sum(v["height_changes"] for v in per_net.values())
     s = sc.scale
-    J = (sc.w["area"] * W * H / s["A0"] + sc.w["length"] * Lt / s["L0"] + sc.w["bends"] * Bt / s["B0"]
-         + sc.w["height_changes"] * Ct / s["C0"])
+    J = sc.w["area"] * W * H / s["A0"] + sum(net_cost(sc, nid, v) for nid, v in per_net.items())
     metrics = {"W_m": round(W / 1000, 2), "H_m": round(H / 1000, 2), "area_m2": round(W * H / 1e6, 1),
                "L_m": round(Lt / 1000, 1), "bends": Bt, "height_changes": Ct, "J": round(J, 4), "per_net": per_net}
     return sorted(set(viol)), metrics
+
+
+def net_cost(sc, nid, v):
+    """单根管的目标代价（含本管权重倍数）；v 为 check_routes 的 per_net 项。"""
+    npar, s = sc.net_param(nid), sc.scale
+    return (sc.w["length"] * npar["wl"] * v["L_mm"] / s["L0"] + sc.w["bends"] * npar["wb"] * v["bends"] / s["B0"]
+            + sc.w["height_changes"] * npar["wc"] * v["height_changes"] / s["C0"])
 
 
 def _exit_len(sc, dev, p, a, s, trim):

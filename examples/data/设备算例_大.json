@@ -56,6 +56,12 @@
     "equipment_spacing": {
      "enabled": true,
      "gap_mm": 800
+    },
+    "equipment_keepout": {
+     "enabled": true
+    },
+    "pipe_keepout": {
+     "enabled": true
     }
    },
    "pitch_mm": 300,

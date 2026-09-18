@@ -27,6 +27,8 @@ ROUTING = {
         "junction_merge_exemption": {"enabled": True},                       # 汇合于同一三通的管在口附近不算冲突
         "internal_spools":          {"enabled": True},                       # 三通内部短管是其他管的障碍
         "equipment_spacing":        {"enabled": False},                      # 移动设备时的设备间距（本示例不移动设备）
+        "equipment_keepout":        {"enabled": False},                      # 设备禁区（区域在输入里给出）
+        "pipe_keepout":             {"enabled": False},                      # 管道禁区（区域在输入里给出）
     },
     # —— 协商布线
     "max_iters": 60,                # 协商最多轮数

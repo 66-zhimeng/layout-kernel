@@ -44,8 +44,9 @@ from . import placement_cpsat as base
 
 # ============================================================ 预处理
 class Problem:
-    def __init__(self, blocks, nets, P, weights, access=None, margins=None, trunk=False):
+    def __init__(self, blocks, nets, P, weights, access=None, margins=None, trunk=False, keepout=None):
         self.blocks, self.nets, self.P, self.w = blocks, nets, P, weights
+        self.keepout = [tuple(r) for r in (keepout or [])]            # 设备禁区（网格单位平面矩形 x0,y0,x1,y1）
         self.trunk = trunk
         self.access = access_rects_factory(P, access) if access else None
         self.margins = side_margins_factory(P, margins) if margins else None
@@ -566,6 +567,9 @@ def evaluate(pr, st, threshold=math.inf):
         pr.stats["infeasible_lp"] += 1
         return math.inf, None
     pr.stats["lp"] += 1
+    if pr.keepout and _in_keepout(pr, sol):
+        pr.stats["keepout"] = pr.stats.get("keepout", 0) + 1
+        return math.inf, None
     try:
         v = base.validate(pr.blocks, pr.nets, pr.P, sol, pr.w, "v2")
     except AssertionError:
@@ -576,6 +580,17 @@ def evaluate(pr, st, threshold=math.inf):
     if pr.trunk:
         extra += trunk_extra(pr, sk, sol)
     return v["J_full_weights"] + pr.w["length"] * (sk["detour"] + extra) / pr.P["L0"], sol
+
+
+def _in_keepout(pr, sol):
+    """任一块（按所选姿态的外形）与设备禁区有重叠面积即为真。"""
+    for b, s in zip(pr.blocks, sol):
+        p = b["poses"][s["pose"]]
+        x0, y0, x1, y1 = s["x"], s["y"], s["x"] + p["W"], s["y"] + p["H"]
+        for kx0, ky0, kx1, ky1 in pr.keepout:
+            if x0 < kx1 and kx0 < x1 and y0 < ky1 and ky0 < y1:
+                return True
+    return False
 
 
 GUIDE_REQUIRED = ["fn", "every_s", "ema", "w_max"]
@@ -662,9 +677,9 @@ def decode(pr, arr):
 
 # ============================================================ 模拟退火（单进程）
 def anneal(args):
-    (path, weights, budget, t_start, seed, cycle, T0, T1, access, margins, guide, trunk, shared) = args
+    (path, weights, budget, t_start, seed, cycle, T0, T1, access, margins, guide, trunk, keepout, shared) = args
     blocks, nets, P = base.load(path)
-    pr = Problem(blocks, nets, P, weights or P["w"], access, margins, trunk)
+    pr = Problem(blocks, nets, P, weights or P["w"], access, margins, trunk, keepout)
     if guide is not None:
         miss = [k for k in GUIDE_REQUIRED if k not in guide]
         if miss:
@@ -741,14 +756,15 @@ def anneal(args):
 
 
 def run(path, budget, procs=12, seed=0, cycle=10.0, T0=0.05, T1=0.001, weights=None, access=None, margins=None,
-        guide=None, trunk=False):
+        guide=None, trunk=False, keepout=None):
     """并行退火；返回全局最好解与合并后的“时间—最好 J”曲线。
     access = {"D_mm", "delta_ep_mm"} 时启用端口接入区约束（默认不启用，与第 9 节实验一致）。
     margins = {"D_mm", "delta_pp_mm", "delta_ep_mm", "c_rho"} 时启用按侧出管留空（见 side_margins_factory）；
       再加 "traffic": True, "heights_mm": {块 id: 高度}, "z_max_mm", "K" 时启用缝隙穿行容量（见 traffic_demand）。
     guide = {"fn": 解 → {"ok", "L_m", "L_net_m"}（须可跨进程序列化）, "every_s", "ema", "w_max"} 时启用布管引导，
       返回的 J 为 J_route（见模块说明）。
-    trunk=True 时多端点管网按“主干 + 分支”估计管长（见模块说明）。"""
+    trunk=True 时多端点管网按“主干 + 分支”估计管长（见模块说明）。
+    keepout = [(x0, y0, x1, y1), ...]（网格单位）时，块不得与这些平面矩形重叠。"""
     t_start = time.time()
     blocks, nets, P = base.load(path)
     pr = Problem(blocks, nets, P, weights or P["w"])
@@ -757,7 +773,7 @@ def run(path, budget, procs=12, seed=0, cycle=10.0, T0=0.05, T1=0.001, weights=N
     mgr_lock = ctx.Lock()
     gJ = ctx.Value("d", math.inf, lock=False)
     gArr = ctx.Array("i", size, lock=False)
-    jobs = [(path, weights, budget, t_start, seed * 1000 + k, cycle, T0, T1, access, margins, guide, trunk,
+    jobs = [(path, weights, budget, t_start, seed * 1000 + k, cycle, T0, T1, access, margins, guide, trunk, keepout,
              (gJ, gArr, mgr_lock))
             for k in range(procs)]
     if procs == 1:
