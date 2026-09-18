@@ -817,7 +817,8 @@ def _route_net(G, sc, net, ctx):
     if bad:
         return None, "端口正前方不足 ℓ_min：" + "、".join(f"{d}.{p}" for d, p in bad)
     ctx = {**ctx, "ex_nodes": ex_nodes, "ex_edges": ex_edges, "rho": npar["rho"], "lmin": npar["lmin"],
-           "zc_max": npar["zc_max"], "self_clear": (npar["D"] + sc.gap_pp) if sc.self_on else 0.0, "inside": inside,
+           "zc_max": npar["zc_max"], "inside": inside,
+           "self_clear": (npar["D"] + sc.gap_pp) if sc.self_on and not ctx.get("relax_self") else 0.0,
            "port_straight": npar["port_straight"], "wl": npar["wl"], "wb": npar["wb"], "wc": npar["wc"]}
     P = {t: sc.port(*t)[:3] for t in terms}
     man = lambda u, v: sum(abs(P[u][a] - P[v][a]) for a in range(3))
@@ -1056,6 +1057,48 @@ def negotiate(sc, log=print):
         tc = round(time.time() - t_c, 1)
     history[-1]["cleanup"] = {"records": records, "time_s": tc}
     return out, history, G
+
+
+# ============================================================ 下界：每根管单独的精确最短路
+_LB = {}
+
+
+def _lb_init(devices, nets, rp, weights, scale, fixed_routes, spools, pipe_keepout, max_expansions):
+    sc = Scene(devices, nets, {**rp, "astar_weight": 1.0, "max_expansions": max_expansions}, weights, scale,
+               fixed_routes, spools, pipe_keepout)
+    _LB["sc"], _LB["G"] = sc, Grid(sc)
+
+
+def _lb_one(nid):
+    sc, G = _LB["sc"], _LB["G"]
+    net = next(n for n in sc.nets if n["id"] == nid)
+    if len(net["terms"]) != 2:
+        return nid, None, "多端点管网：树为贪心构造，不给下界"
+    stats = {"expansions": 0, "exhausted": 0}
+    br, why = route_net(G, sc, net, {"halo": _Zero(), "hist": _Zero(), "pres": 0.0, "stats": stats, "relax_self": True})
+    if br is None:
+        return nid, None, ("超过扩展上限" if stats["exhausted"] else f"单独也布不通：{why}")
+    per = check_routes(sc, {nid: br})[1]["per_net"][nid]
+    return nid, net_cost(sc, nid, per), None
+
+
+def lower_bounds(sc, max_expansions, workers):
+    """总代价的下界：设备位置 / 朝向固定时，每根两端点管单独求精确最短路（A* 不加权、不考虑其他待布管，
+    固定管路与禁区照样是障碍），各管之和。
+    为保证是下界，求解时放宽“同一根管自身净距”（带着它搜索时支配剪枝可能剪掉可行走法，结果会偏大）；
+    放宽约束只会让最优值变小，所以仍是有效下界。返回 {管: (下界代价或 None, 说明)}。"""
+    args = (sc.dev, sc.nets, sc.rp, sc.w, sc.scale, sc.fixed_routes, sc.spools, sc.pipe_keepout, max_expansions)
+    ids = [n["id"] for n in sc.nets]
+    if workers <= 1 or len(ids) < 2:
+        _lb_init(*args)
+        res = [_lb_one(i) for i in ids]
+    else:
+        import multiprocessing as mp
+        from concurrent.futures import ProcessPoolExecutor
+        with ProcessPoolExecutor(min(workers, len(ids)), mp_context=mp.get_context("spawn"),
+                                 initializer=_lb_init, initargs=args) as ex:
+            res = list(ex.map(_lb_one, ids))
+    return {nid: (v, why) for nid, v, why in res}
 
 
 # ============================================================ 清理：其他管网固定为硬障碍，单独重布冲突管网

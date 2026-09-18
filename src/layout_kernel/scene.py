@@ -5,13 +5,15 @@
 
 输入（米制、Y 向上，与网页 networkMILPInput 相同）：
   nodes:  [{id, box: bool, orientations: [{ports: {key: {position, normal}}, box: {min, max} | null,
-            spools: [[p, q], ...]}]}]          —— 本函数只用 orientations[0]（当前姿态）
+            spools: [[p, q], ...]}]}]          —— orientations[0] 是当前姿态，其余是允许换成的朝向
   routes: [{id, code, points, segments: [{r}], from: {key}, to: {key}, leadA, leadB, fixed, low}]
 settings（全部必填）：
   routing:   布管参数（毫米，同 routing.REQUIRED；D_default_mm 仅作缺省，实际按每根管的外径）
   weights / scale：目标权重与归一化尺度（同 routing.Scene）
   约束开关与参数一律在 routing.constraints 下（见 constraints.py）；本模块用到 low_pipes、equipment_spacing
   oblique_stub_mm：斜向端口在基线里找不到斜段时，沿法向伸出的短管长度
+  rotation_candidates：每个可转节点每轮最多真实重布几种朝向（先按端口距离与弯头下界估计排序）
+  lower_bound：{"enabled": bool, "max_expansions": 单管精确搜索的扩展上限}；打开时报告下界与差距（见 _attach_bound）
   pipe_rules：对方的直管规则，用来推算每根管的 rho / lead（见 _straight_rules）：
     {"trim_ratio": 弯头最多占相邻直管的比例, "radius_margin_mm": 有效弯曲半径须超过管半径的量,
      "port_margin_mm": 端口直颈之外的余量, "safety": 放大系数,
@@ -25,7 +27,7 @@ import time
 
 from . import constraints
 from . import routing as rt
-SETTINGS_REQUIRED = ["routing", "weights", "scale", "oblique_stub_mm", "pipe_rules"]
+SETTINGS_REQUIRED = ["routing", "weights", "scale", "oblique_stub_mm", "pipe_rules", "rotation_candidates", "lower_bound"]
 SERIAL_NETS = 8                                                 # 每个并行进程至少分到的管数
 RULES_REQUIRED = ["trim_ratio", "radius_margin_mm", "port_margin_mm", "safety", "rule_D_mm", "rule_R_mm"]
 
@@ -365,6 +367,39 @@ def _net_costs(r):
 
 
 def optimize_scene(inp, settings, log=None):
+    out, final_inp, deltas = _optimize(inp, settings, log)
+    return _attach_bound(out, final_inp, settings, deltas, log)
+
+
+def _attach_bound(out, final_inp, settings, deltas, log):
+    """在最终位置 / 朝向下计算下界与差距（lower_bound.enabled 时）。代价与下界都是内核目标口径（含单管权重）。"""
+    cfg = settings["lower_bound"]
+    if not isinstance(cfg, dict) or not isinstance(cfg.get("enabled"), bool):
+        raise KeyError("lower_bound 需要 {enabled: true/false, max_expansions}")
+    if not cfg["enabled"] or not out.get("ok") or out.get("cost") is None:
+        out["lower_bound"] = None
+        return out
+    t0 = time.time()
+    sc, _meta = build_scene(final_inp, settings, (), deltas)
+    per = rt.lower_bounds(sc, int(cfg["max_expansions"]), sc.rp["route_workers"] if len(sc.nets) >= 2 * SERIAL_NETS
+                          else 1)
+    missing = {k: why for k, (v, why) in per.items() if v is None}
+    lb = sum(v for v, _ in per.values() if v is not None)
+    valid = not missing
+    out["lower_bound"] = {
+        "valid": valid, "value": round(lb, 4) if valid else None, "cost": out["cost"],
+        "gap": round((out["cost"] - lb) / out["cost"], 4) if valid and out["cost"] > 0 else None,
+        "nets": len(per), "unresolved": dict(list(missing.items())[:20]), "seconds": round(time.time() - t0, 1),
+        "note": ("设备位置与朝向固定为最终方案时的下界：各管单独求精确最短路（不考虑其他待布管、放宽同管自身净距）之和；"
+                 "不是设备也能移动时的全局下界。代价为内核目标口径（管长、弯头、高度变化加权，含单管权重）。")}
+    if valid:
+        log(f"下界 {lb:.3f}，当前 {out['cost']:.3f}，差距 ≤ {out['lower_bound']['gap']:.1%}（{time.time() - t0:.1f} s）")
+    else:
+        log(f"下界不完整：{len(missing)} 根管没有得到精确最短路")
+    return out
+
+
+def _optimize(inp, settings, log=None):
     """布管 + 设备移动（局部或全局，范围由输入的 move 标记与 fixed 管决定）。只做平移，不改朝向。
       1. 按当前姿态重布范围内全部管，得到基准；
       2. 逐个试候选移动（串联拉直、单个对齐，见 _candidates）。每个候选只重布与被移动对象相连的管，
@@ -376,22 +411,30 @@ def optimize_scene(inp, settings, log=None):
     limit = float(inp.get("seconds") or math.inf)
     radius = float(inp.get("radius") or 0)                        # 各轴移动范围（米，网页坐标）
     movable = [n["id"] for n in inp["nodes"] if n.get("move")]
-    owner = {k: n["id"] for n in inp["nodes"] for k in n["orientations"][0]["ports"]}
+    rotatable = [n["id"] for n in inp["nodes"] if len(n["orientations"]) > 1]
+    owner = {k: n["id"] for n in inp["nodes"] for k in (x for o in n["orientations"] for x in o["ports"])}
     scope = [r for r in inp["routes"] if not r.get("fixed")]
     first = _route_once(inp, settings, (), None)
-    log(f"当前姿态重布：{'通过' if first['ok'] else '有违规'}，代价 {first['cost']:.3f}；可移动节点 {len(movable)} 个，移动范围 ±{radius} m")
+    log(f"当前姿态重布：{'通过' if first['ok'] else '有违规'}，代价 {first['cost']:.3f}；可移动节点 {len(movable)} 个，"
+        f"可转节点 {len(rotatable)} 个，移动范围 ±{radius} m")
     if not first["ok"]:
-        return _result(first, {}, [], 0, first["cost"], log)
+        return _result(first, {}, [], 0, first["cost"], log), inp, {}
+    orient = {}
     routes_w = {r["id"]: r["points"] for r in _to_web_routes(first["meta"], first["routes"])}
     cost = _net_costs(first)
     deltas, tried, accepted, meta_now = {}, 0, [], first
     improved = True
-    while improved and movable and radius > 0 and time.time() - t0 < limit:
+    while improved and (movable and radius > 0 or rotatable) and time.time() - t0 < limit:
         improved = False
-        for name, move in _candidates(_shifted(inp, deltas), meta_now["meta"] | {"sc": meta_now["sc"]}, movable, radius):
+        now = _shifted(_posed(inp, orient), deltas)
+        info = meta_now["meta"] | {"sc": meta_now["sc"]}
+        cands = [(nm, mv, {}) for nm, mv in (_candidates(now, info, movable, radius) if movable and radius > 0 else [])]
+        cands += _rotation_candidates(now, info, rotatable, orient, deltas, settings, settings["rotation_candidates"])
+        for name, move, rot in cands:
             if time.time() - t0 > limit:
                 break
             trial = dict(deltas)
+            trial_orient = {**orient, **rot}
             for nid, d in move.items():
                 acc = tuple(trial.get(nid, (0.0, 0.0, 0.0))[i] + d[i] for i in range(3))
                 if any(abs(v) > radius + 1e-9 for v in acc):
@@ -403,15 +446,16 @@ def optimize_scene(inp, settings, log=None):
                 if not inc:
                     continue
                 tried += 1
-                sub = {**inp, "routes": [r if r["id"] in inc or r.get("fixed") else {**r, "points": routes_w[r["id"]], "fixed": True}
-                                         for r in inp["routes"]]}
+                sub = {**_posed(inp, trial_orient),
+                       "routes": [r if r["id"] in inc or r.get("fixed") else {**r, "points": routes_w[r["id"]], "fixed": True}
+                                  for r in inp["routes"]]}
                 r = _route_once(sub, settings, (), trial)
                 if not r["ok"]:
                     continue
                 new = _net_costs(r)
                 gain = sum(cost[x] for x in inc) - sum(new[x] for x in inc)
                 if gain > 1e-9:
-                    deltas, meta_now = trial, r
+                    deltas, meta_now, orient = trial, r, trial_orient
                     for x in _to_web_routes(r["meta"], r["routes"]):
                         routes_w[x["id"]] = x["points"]
                     cost.update(new)
@@ -421,20 +465,21 @@ def optimize_scene(inp, settings, log=None):
                     break                                              # 姿态变了，重新生成候选
     total_inc = sum(cost.values())
     if accepted:
-        final = _route_once(inp, settings, (), deltas)                # 最终姿态下联合重布全部范围内的管
+        final = _route_once(_posed(inp, orient), settings, (), deltas)   # 最终姿态下联合重布全部范围内的管
         if final["ok"] and final["cost"] <= total_inc + 1e-9:
-            return _result(final, deltas, accepted, tried, first["cost"], log, time.time() - t0)
+            return _result(final, deltas, accepted, tried, first["cost"], log, time.time() - t0, orient), _posed(inp, orient), deltas
         log(f"联合重布未更好（{final['cost']:.3f} ≥ {total_inc:.3f}），采用逐步移动的结果")
-        out = _result(first, deltas, accepted, tried, first["cost"], log, time.time() - t0)
+        out = _result(first, deltas, accepted, tried, first["cost"], log, time.time() - t0, orient)
         out.update(routes=[{"id": k, "code": next(r.get("code") for r in scope if r["id"] == k), "points": v}
                            for k, v in routes_w.items()], cost=round(total_inc, 4), metrics=None)
-        return out
-    return _result(first, deltas, accepted, tried, first["cost"], log, time.time() - t0)
+        return out, _posed(inp, orient), deltas
+    return _result(first, deltas, accepted, tried, first["cost"], log, time.time() - t0), inp, {}
 
 
-def _result(r, deltas, accepted, tried, base_cost, log, seconds=0.0):
+def _result(r, deltas, accepted, tried, base_cost, log, seconds=0.0, orient=None):
     offsets = {nid: list(d) for nid, d in deltas.items() if any(abs(v) > 1e-9 for v in d)}
     return {"ok": r["ok"], "violations": r["viol"],
+            "orientations": {k: v for k, v in (orient or {}).items() if v},   # 节点 → 输入 orientations 里的下标
             "metrics": {k: v for k, v in r["met"].items() if k != "per_net"},
             "routes": _to_web_routes(r["meta"], r["routes"]), "offsets": offsets,
             "moves": accepted, "candidates_tried": tried,
@@ -442,6 +487,62 @@ def _result(r, deltas, accepted, tried, base_cost, log, seconds=0.0):
             "cost": round(r["cost"], 4) if r["cost"] < math.inf else None,
             "iterations": len(r["history"]), "grid_nodes": r["G"].size,
             "timing": {"route_s": round(seconds, 1)}}
+
+
+def _posed(inp, orient):
+    """按朝向选择 {节点: 原始朝向下标} 改写节点：选中的朝向放到 orientations[0]；原始列表保存在 _all。"""
+    nodes = []
+    for n in inp["nodes"]:
+        allo = n.get("_all", n["orientations"])
+        o = orient.get(n["id"], 0)
+        nodes.append({**n, "_all": allo, "orientations": [allo[o]] + [x for i, x in enumerate(allo) if i != o]})
+    return {**inp, "nodes": nodes}
+
+
+def _rotation_candidates(inp, meta0, rotatable, orient, deltas, settings, top):
+    """旋转 / 换向候选：[(说明, {节点: 0 平移}, {节点: 朝向下标})]。每个节点按“端口间曼哈顿距离 + 弯头下界”
+    估计各朝向下相连管道的代价，取最好的 top 个（不含当前朝向）。"""
+    owner = {k: n["id"] for n in inp["nodes"] for k in n["orientations"][0]["ports"]}
+    exact = {k: (meta0["stubs"].get(k) or p["position"]) for k, p in meta0["port_w"].items()}
+    kdir = {k: v[3:] for dev in meta0["sc"].dev.values() for k, v in dev["ports"].items()}
+    w, sc = settings["weights"], settings["scale"]
+    nodes = {n["id"]: n for n in inp["nodes"]}
+    out = []
+    for nid in rotatable:
+        n = nodes[nid]
+        d = deltas.get(nid, (0.0, 0.0, 0.0))
+        pipes = [(r["from"]["key"], r["to"]["key"]) if owner[r["from"]["key"]] == nid else (r["to"]["key"], r["from"]["key"])
+                 for r in inp["routes"] if not r.get("fixed") and nid in (owner[r["from"]["key"]], owner[r["to"]["key"]])]
+        if not pipes:
+            continue
+        ests = []
+        for o, ori in enumerate(n["_all"]):
+            est = 0.0
+            for mine, other in pipes:
+                if other not in exact or mine not in ori["ports"]:
+                    est = math.inf
+                    break
+                pw = [ori["ports"][mine]["position"][i] + d[i] for i in range(3)]
+                q = exact[other]
+                man = 1000 * sum(abs(pw[i] - q[i]) for i in range(3))
+                dp = _axis_dir(ori["ports"][mine]["normal"], mine)
+                dq = kdir.get(other)
+                if dp is None or dq is None:
+                    b = 1
+                else:
+                    dpk, dqk = tuple(dp), tuple(dq)
+                    ax = [i for i in range(3) if dpk[i]][0]
+                    pk, qk = to_k(pw), to_k(q)
+                    facing = dpk == tuple(-v for v in dqk) and all(abs(pk[i] - qk[i]) < 0.5 for i in range(3) if i != ax) \
+                        and (qk[ax] - pk[ax]) * dpk[ax] > 0
+                    b = 0 if facing else (1 if dpk[ax] == 0 or dqk[ax] == 0 else 2)
+                est += w["length"] * man / sc["L0"] + w["bends"] * b / sc["B0"]
+            ests.append((est, o))
+        cur = orient.get(nid, 0)
+        for est, o in sorted(ests)[:top + 1]:
+            if o != cur and est < math.inf:
+                out.append((f"{nid} 换成朝向 {o}（估计 {est:.2f}）", {nid: (0.0, 0.0, 0.0)}, {nid: o}))
+    return out
 
 
 def _shifted(inp, deltas):

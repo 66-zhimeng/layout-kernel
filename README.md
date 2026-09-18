@@ -1,10 +1,10 @@
 # layout-kernel
 
-设备与管道自动排布的计算内核：设备摆放、三维布管、多管协商消冲突、设备平移优化，以及只看几何的独立校验器。
+设备与管道自动排布的计算内核：设备摆放、三维布管、多管协商消冲突、设备平移 / 旋转 / 三通换向优化、下界与差距报告，以及只看几何的独立校验器。
 
 - **约束全部由调用方配置。** 每条约束都有开关和参数（见 [docs/contract.md 第 5 节](docs/contract.md)），内核不写死约束，也不设默认值。
 - **结果以校验器为准。** 返回的违规和指标都来自独立校验器，不依赖求解器内部数据。
-- **启发式求解。** 给出可行且较优的方案，不附带最优性证明。
+- **启发式求解，附下界。** 给出可行且较优的方案；可报告在最终设备位置下离下界的最大差距（不是最优性证明）。
 
 研究过程（数学模型推导、各轮实验与失败记录）在 [math-problem-discussions](https://github.com/66-zhimeng/math-problem-discussions)，本仓库保留了其中内核部分的完整提交历史。
 
@@ -77,6 +77,8 @@ viol, metrics = rt.check_routes(sc, routes)
 | `junction_merge_exemption` | 汇合于同一三通的管在口附近不算冲突 |
 | `internal_spools` | 三通内部短管是其他管的障碍 |
 | `equipment_spacing` | 移动设备时的设备间距 |
+| `equipment_keepout` | 设备禁区（区域在输入里给出） |
+| `pipe_keepout` | 管道禁区（区域在输入里给出） |
 
 每一条都要在配置里显式写 `"enabled": true/false`；参数与关闭时的含义见契约文档。
 
@@ -87,7 +89,7 @@ viol, metrics = rt.check_routes(sc, routes)
 | `constraints.py` | 约束注册表与配置校验 |
 | `routing.py` | 网格、A*、三通、协商布线、清理、独立校验器 |
 | `astar_fast.py` | 单管 A* 的 numba 实现（与 `routing.astar_py` 逐例一致，有测试保证） |
-| `scene.py` / `scene_cli.py` | 三维场景接口：每管管径与直颈、斜支口、固定管路、设备平移优化 |
+| `scene.py` / `scene_cli.py` | 三维场景接口：每管管径与直颈、斜支口、固定管路、设备平移 / 旋转 / 换向优化、下界 |
 | `placement_sp.py` / `placement_cpsat.py` | 块级摆放（序列对 + LP + 并行退火 / CP-SAT）与摆放校验 |
 | `blocking.py` | 设备 → 块：模块识别、模块内部排法、聚簇 |
 | `api.py` / `contract.py` / `build.py` | 任务书接口、契约校验、模块间的粘合 |
@@ -96,14 +98,14 @@ viol, metrics = rt.check_routes(sc, routes)
 ## 测试
 
 ```bash
-.venv/Scripts/python -m pytest -q        # 51 个
+.venv/Scripts/python -m pytest -q        # 56 个
 ```
 
 ## 已知限制
 
 - 管道只走网格线（间距可配置）；管径不同时，占用计算按最大管径保守处理。
-- 设备优化只做平移，不改朝向；摆放只在平面内。
-- 启发式求解，不给最优性证明或下界。
+- 摆放只在平面内；场景优化中的设备移动为平移，朝向在调用方给出的候选朝向里选。
+- 启发式求解；下界只针对最终设备位置，多端点管网不给下界。
 - 示例算例为自拟数据；真实项目的接入例子见上文。
 
 ## 许可

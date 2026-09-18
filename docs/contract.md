@@ -180,19 +180,29 @@ J = w_A · 占地/A₀ + w_L · 管长/L₀ + w_B · 弯头/B₀ + w_C · 高度
 layout-kernel-scene < 请求.json > 结果.json        # 或 python -m layout_kernel.scene_cli
 ```
 
-- 请求：`{"input": 场景, "settings": {"routing": 求解参数 + constraints, "weights", "scale", "oblique_stub_mm", "pipe_rules"}}`
-- 场景：`nodes`（每个节点当前姿态下的端口位置与法向、包围盒、内部短管、是否可移动）、`routes`（两端端口、现有折点、外径、两端直颈长度、是否固定、是否 low）、`radius`（可移动节点每轴移动范围）、`seconds`（时间上限）。坐标为米制、Y 向上。
-- 结果：`{ok, violations, metrics, routes, offsets, moves, cost, base_cost, timing}`。`offsets` 是被移动节点的平移（米，Y 向上）。
-- `pipe_rules` 用来把调用方自己的直管 / 弯头规则换算成内核的直管长度要求（见 `scene._straight_rules`）；只在 `straight_lengths` 打开时生效。
+**请求** `{"input": 场景, "settings": 设置}`
 
-详见 `src/layout_kernel/scene.py` 模块说明。
+- 场景（米制、Y 向上）：
+  - `nodes`：每个节点 `{id, move, box, orientations: [{angle, swap, ports: {key: {position, normal}}, box, spools}]}`。`orientations[0]` 是当前姿态，其余是允许换成的朝向（设备旋转、三通换向与换口），每个朝向的端口已按该朝向算好；`move` 表示可以平移。
+  - `routes`：每根管 `{id, code, points, segments: [{r}], from: {key}, to: {key}, leadA, leadB, fixed, low}`，可选 `weight_length / weight_bends / weight_height_changes`（本管权重倍数）。
+  - `radius`（每轴移动范围，米）、`seconds`（时间上限）。
+  - 可选区域：`equipment_keepout`、`pipe_keepout`（三维盒 `[x0,y0,z0,x1,y1,z1]`，米；是否生效由同名约束决定）。
+- 设置：`routing`（求解参数 + `constraints`）、`weights`、`scale`、`oblique_stub_mm`、`pipe_rules`、
+  `rotation_candidates`（每个可转节点每轮真实重布几种朝向）、`lower_bound`（`{enabled, max_expansions}`）。
+
+**结果** `{ok, violations, metrics, routes, offsets, orientations, moves, cost, base_cost, lower_bound, timing}`
+
+- `offsets`：被移动节点的平移（米，Y 向上）；`orientations`：换了朝向的节点 → 输入 `orientations` 里的下标（调用方据此施加旋转 / 换口）。
+- `lower_bound`：`{valid, value, cost, gap, nets, unresolved, note}`。设备位置与朝向固定为最终方案时，各两端点管单独求精确最短路（不考虑其他待布管、放宽同管自身净距）之和；`gap = (cost − value) / cost` 是当前方案离这一下界的最大相对差距。它**不是**设备也能移动时的全局下界；多端点管网不给下界。
+- `pipe_rules` 用来把调用方自己的直管 / 弯头规则换算成内核的直管长度要求（见 `scene._straight_rules`），只在 `straight_lengths` 打开时生效。
+
+**优化过程**：先按当前姿态重布；再逐个试候选（串联拉直、单个对齐、换朝向），每个候选只重布相连的管、其余固定，代价下降就接受；最后按最终姿态联合重布一次取更好者。换朝向的候选先按“端口间曼哈顿距离 + 弯头下界”估计排序，只真实重布前 `rotation_candidates` 个。
 
 ## 8. 还没有的能力
 
 | 需求 | 现状 |
 |---|---|
-| 设备旋转、三通换向（场景接口） | 未实现，目前只做平移 |
-| 禁止设备放在某区域 | 未实现（`keepout` 只挡管道） |
-| 按单根管设权重 | 未实现 |
 | 设备之间的相对关系约束（必须相邻、必须靠墙） | 未实现 |
-| 最优性证明 / 下界与差距 | 未实现，当前为启发式 |
+| 设备也能移动时的全局下界 / 最优性证明 | 未实现；当前下界只针对最终设备位置 |
+| 多端点管网的下界 | 未实现（树为贪心构造） |
+| 任务书摆放中的设备禁区 | 已实现，但方式是“碰到禁区的候选判为不可行”，禁区靠近布局原点时搜索效率低 |

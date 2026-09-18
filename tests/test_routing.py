@@ -327,3 +327,23 @@ def test_pipe_keepout_is_avoided_and_checked():
     assert rt.check_routes(sc, routes)[0] == [] and len(routes["n"][0]["points"]) > 2
     straight = {"n": [{"start": ("A", "p"), "end": ("port", ("B", "q")), "points": [(1000, 500, 500), (5000, 500, 500)]}]}
     assert any("管道禁区" in v for v in rt.check_routes(sc, straight)[0])
+
+
+def test_lower_bound_equals_cost_for_single_uncontested_net():
+    """只有一根管、没有竞争时，下界（单管精确最短路）等于布出来的代价；有另一根管挤占时，下界不超过实际代价。"""
+    dev = two_facing(gap=3000, dy=1500)
+    nets = [{"id": "n", "terms": [("A", "p"), ("B", "q")]}]
+    sc = scene(dev, nets, K=3)
+    routes, _ = route_one(sc)
+    cost = rt.net_cost(sc, "n", rt.check_routes(sc, routes)[1]["per_net"]["n"])
+    lb = rt.lower_bounds(sc, 300000, 1)["n"][0]
+    assert abs(lb - cost) < 1e-9
+    dev2 = {"A": box(0, 0, 1000, 1000, ports={"p": (1000, 400, 500, 1, 0, 0), "p2": (1000, 700, 500, 1, 0, 0)}),
+            "B": box(4000, 0, 1000, 1000, ports={"q": (4000, 700, 500, -1, 0, 0), "q2": (4000, 400, 500, -1, 0, 0)})}
+    nets2 = [{"id": "n1", "terms": [("A", "p"), ("B", "q")]}, {"id": "n2", "terms": [("A", "p2"), ("B", "q2")]}]
+    sc2 = scene(dev2, nets2, K=3)
+    r2, _ = route_one(sc2)
+    per = rt.check_routes(sc2, r2)[1]["per_net"]
+    total = sum(rt.net_cost(sc2, k, v) for k, v in per.items())
+    lbs = rt.lower_bounds(sc2, 300000, 1)
+    assert sum(v for v, _ in lbs.values()) <= total + 1e-9
