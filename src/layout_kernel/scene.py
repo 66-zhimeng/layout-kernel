@@ -296,6 +296,41 @@ def _route_once(inp, settings, fixed_ids=(), deltas=None, log=None):
             "cost": cost if ok else math.inf, "history": history, "G": G}
 
 
+def _baseline(inp, settings):
+    """把输入里范围内各管的现有路径换算成内核折线，用内核校验器检查并计算代价，作为比较基准（省去一次整网重布）。
+    斜口的斜段不在内核折线里：沿用基线斜段时去掉它。任何一根不符合内核规则（非轴向、端口不符、违规）就返回
+    (None, 原因)，由调用方改为整网重布。返回的结果带 "web"：原样的网页路径（不经取整）。"""
+    sc, meta = build_scene(inp, settings)
+    owner = {k: n["id"] for n in inp["nodes"] for k in n["orientations"][0]["ports"]}
+    routes, web = {}, {}
+    for r in inp["routes"]:
+        if r.get("fixed"):
+            continue
+        a, z = r["from"]["key"], r["to"]["key"]
+        pts = [to_k(q) for q in r["points"]]
+        if a in meta["stubs"]:
+            pts = pts[1:]
+        if z in meta["stubs"]:
+            pts = pts[:-1]
+        pts = [q for i, q in enumerate(pts) if i == 0 or q != pts[i - 1]]
+        if len(pts) < 2:
+            return None, (f"{r.get('code')} 路径过短", frozenset())
+        routes[r["id"]] = [{"start": (owner[a], a), "end": ("port", (owner[z], z)), "points": pts}]
+        web[r["id"]] = r["points"]
+    try:
+        viol, met = rt.check_routes(sc, routes)
+    except ValueError as ex:
+        return None, (str(ex), frozenset())
+    if viol:
+        bad = frozenset(t for v in viol for t in re.findall(r"[\w\-]+", v) if t in routes)
+        if len(bad) > max(3, len(routes) // 5):                      # 大面积不符：不如整网重布
+            bad = frozenset()
+        return None, (f"{len(viol)} 条不符合内核规则，如 {viol[0]}", bad)
+    cost = sum(rt.net_cost(sc, nid, v) for nid, v in met["per_net"].items())
+    return {"sc": sc, "meta": meta, "routes": routes, "viol": [], "met": met, "ok": True, "cost": cost,
+            "history": [{}], "G": None, "web": web}, None
+
+
 def _to_web_routes(meta, routes):
     out = []
     for nid, brs in routes.items():
@@ -510,13 +545,29 @@ def _optimize(inp, settings, log=None):
     rotatable = [n["id"] for n in inp["nodes"] if len(n["orientations"]) > 1]
     owner = {k: n["id"] for n in inp["nodes"] for k in (x for o in n["orientations"] for x in o["ports"])}
     scope = [r for r in inp["routes"] if not r.get("fixed")]
-    first = _route_once(inp, settings, (), None)
-    log(f"当前姿态重布：{'通过' if first['ok'] else '有违规'}，代价 {first['cost']:.3f}；可移动节点 {len(movable)} 个，"
-        f"可转节点 {len(rotatable)} 个，移动范围 ±{radius} m")
+    first, why = _baseline(inp, settings)
+    if first is None and why[1]:                                   # 只有少数管不符合：只重布这几根，其余沿用现有路径
+        bad = why[1]
+        cur = {r["id"]: r["points"] for r in inp["routes"]}
+        r = _route_once(_sub_input(inp, {}, bad, cur), settings, (), None)
+        if r["ok"]:
+            cur.update({x["id"]: x["points"] for x in _to_web_routes(r["meta"], r["routes"])})
+            first, why2 = _baseline({**inp, "routes": [{**x, "points": cur[x["id"]]} for x in inp["routes"]]}, settings)
+            if first is not None:
+                log(f"当前布局有 {len(bad)} 根管不符合内核规则，只重布这几根（{time.time() - t0:.1f} s）")
+            else:
+                why = why2
+    if first is not None:
+        log(f"以当前布局为基准（内核校验通过），代价 {first['cost']:.3f}（{time.time() - t0:.1f} s）；可移动节点 {len(movable)} 个，"
+            f"可转节点 {len(rotatable)} 个，移动范围 ±{radius} m")
+    else:
+        first = _route_once(inp, settings, (), None)
+        log(f"当前布局不能直接作基准（{why[0]}），按当前姿态重布：{'通过' if first['ok'] else '有违规'}，代价 {first['cost']:.3f}；"
+            f"可移动节点 {len(movable)} 个，可转节点 {len(rotatable)} 个，移动范围 ±{radius} m")
     if not first["ok"]:
         return _result(first, {}, [], 0, first["cost"], log), inp, {}
     light = {**settings, "routing": {**settings["routing"], **settings["candidate_routing"], "route_workers": 1}}
-    routes_w = {r["id"]: r["points"] for r in _to_web_routes(first["meta"], first["routes"])}
+    routes_w = dict(first["web"]) if first.get("web") else         {r["id"]: r["points"] for r in _to_web_routes(first["meta"], first["routes"])}
     cost = _net_costs(first)
     orient, deltas, tried, accepted = {}, {}, 0, []
     info = first["meta"] | {"sc": first["sc"]}
@@ -692,7 +743,8 @@ def _result(r, deltas, accepted, tried, base_cost, log, seconds=0.0, orient=None
     return {"ok": r["ok"], "violations": r["viol"],
             "orientations": {k: v for k, v in (orient or {}).items() if v},   # 节点 → 输入 orientations 里的下标
             "metrics": {k: v for k, v in r["met"].items() if k != "per_net"},
-            "routes": _to_web_routes(r["meta"], r["routes"]), "offsets": offsets,
+            "routes": ([{"id": k, "code": r["meta"]["meta"][k]["code"], "points": v} for k, v in r["web"].items()]
+                       if r.get("web") else _to_web_routes(r["meta"], r["routes"])), "offsets": offsets,
             "moves": accepted, "candidates_tried": tried,
             "base_cost": round(base_cost, 4) if base_cost < math.inf else None,
             "cost": round(r["cost"], 4) if r["cost"] < math.inf else None,
