@@ -152,8 +152,9 @@ def build_scene(inp, settings, fixed_ids=(), deltas=None):
     for r in inp["routes"]:
         D = 2000 * max(s["r"] for s in r["segments"])
         if r["id"] in fixed_ids or r.get("fixed"):
-            ends = [devices[port_owner[r[k]["key"]]]["box"] is None for k in ("from", "to")]
-            fixed[r["id"]] = {"points": [to_k(q) for q in r["points"]], "D_mm": round(D, 1), "trim": ends}
+            ends = [port_owner[r[k]["key"]] if devices[port_owner[r[k]["key"]]]["box"] is None else None
+                    for k in ("from", "to")]
+            fixed[r["id"]] = {"points": [to_k(q) for q in r["points"]], "D_mm": round(D, 1), "trim_nodes": ends}
             continue
         rho, lmin, (ps_a, ps_b) = _straight_rules((1000 * r["leadA"], 1000 * r["leadB"]), settings["pipe_rules"])
         ka, kb = r["from"]["key"], r["to"]["key"]
@@ -176,6 +177,19 @@ def build_scene(inp, settings, fixed_ids=(), deltas=None):
         for p_, q_ in n["orientations"][0].get("spools") or []:
             spools.append({"owner": n["id"], "D_mm": round(max(attached.get(n["id"], [rp["D_default_mm"]])), 1),
                            "points": [to_k([p_[i] + d[i] for i in range(3)]), to_k([q_[i] + d[i] for i in range(3)])]})
+    # 斜支口的斜段（端口 → 斜段终点）不在布管折线里，但它是实体管：按所属节点的内部短管处理（其他管不得靠近，
+    # 接在该节点上的管豁免首末段）。斜段按管半径分成小段，避免整段的包围盒过于保守
+    for r in inp["routes"]:
+        if r["id"] in fixed_ids or r.get("fixed"):
+            continue                                            # 固定管路的折线里已含斜段
+        D = 2000 * max(s_["r"] for s_ in r["segments"])
+        for end in ("from", "to"):
+            key = r[end]["key"]
+            if key in stubs:
+                a, b = port_w[key]["position"], stubs[key]
+                n = max(1, math.ceil(1000 * math.dist(a, b) / (D / 2)))
+                spools.append({"owner": port_owner[key], "D_mm": round(D, 1),
+                               "points": [to_k([a[i] + (b[i] - a[i]) * k / n for i in range(3)]) for k in range(n + 1)]})
     # 并行进程各自要建一遍网格：管少时并行不划算，按每进程至少 SERIAL_NETS 根管分配
     rp["route_workers"] = max(1, min(rp["route_workers"], len(nets) // SERIAL_NETS))
     pipe_keepout = [_box_k({"min": b[:3], "max": b[3:]}) for b in inp.get("pipe_keepout", [])]
@@ -434,7 +448,9 @@ def _optimize(inp, settings, log=None):
          取有改进的候选，按改进量从大到小挑出互不相干（移动对象与相关管都不重叠）的一批，
          合在一起再评估一次确认仍有改进后一次接受（确认不通过则只接受最好的一个）；
       3. 没有改进或到达时间上限后，按最终姿态用完整参数把范围内全部管联合重布一次，取两者中更好的。
-    所有比较都用内核自己的指标（校验器口径）；最终是否采用由调用方的校验决定。"""
+    所有比较都用内核自己的指标（校验器口径）；最终是否采用由调用方的校验决定。
+    输入给出 lengthCap（米，全部管道折线总长上限，含范围外的管）时：只接受总长不超过上限的候选（已超出时不再增加），
+    最终方案仍超出则判为不通过并说明。"""
     log = log or (lambda _l: None)
     t0 = time.time()
     limit = float(inp.get("seconds") or math.inf)
@@ -451,6 +467,13 @@ def _optimize(inp, settings, log=None):
     light = {**settings, "routing": {**settings["routing"], **settings["candidate_routing"], "route_workers": 1}}
     routes_w = {r["id"]: r["points"] for r in _to_web_routes(first["meta"], first["routes"])}
     cost = _net_costs(first)
+    cap = float(inp["lengthCap"]) if inp.get("lengthCap") is not None else math.inf
+    plen = {r["id"]: _plen(r["points"]) for r in inp["routes"]} | {k: _plen(v) for k, v in routes_w.items()}
+
+    def within(rw):                                                # 换上 rw 这些管的新路径后，总长是否仍在上限内
+        total = sum(plen.values())
+        new = total + sum(_plen(v) - plen[k] for k, v in rw.items())
+        return new <= max(cap, total) + 1e-6
     orient, deltas, tried, accepted = {}, {}, 0, []
     info = first["meta"] | {"sc": first["sc"]}
     workers = int(settings["routing"]["route_workers"])
@@ -492,7 +515,7 @@ def _optimize(inp, settings, log=None):
                 if ok:
                     inc = meta[k][2]
                     gain = sum(cost[x] for x in inc) - sum(new[x] for x in inc)
-                    if gain > 1e-9:
+                    if gain > 1e-9 and within(rw):
                         good.append((gain, k, new, rw))
             if not good:
                 break
@@ -515,9 +538,9 @@ def _optimize(inp, settings, log=None):
                 _ev_init(inp, light)
                 _k, ok, new, rw = _ev_one((0, trial, trial_orient, frozenset(inc_all), routes_w))
                 gain = sum(cost[x] for x in inc_all) - sum(new[x] for x in inc_all) if ok else -math.inf
-                if ok and gain > batch[0][0] - 1e-9:
+                if ok and gain > batch[0][0] - 1e-9 and within(rw):
                     deltas, orient = trial, trial_orient
-                    routes_w.update(rw); cost.update(new)
+                    routes_w.update(rw); cost.update(new); plen.update({x: _plen(v) for x, v in rw.items()})
                     for g in batch:
                         accepted.append({"move": meta[g[1]][0], "gain": round(g[0], 4)})
                     log(f"本轮并行接受 {len(batch)} 个候选，代价 -{gain:.3f}")
@@ -527,7 +550,7 @@ def _optimize(inp, settings, log=None):
             gain, k, new, rw = batch[0]
             name = meta[k][0]
             deltas, orient = tasks[k][1], tasks[k][2]
-            routes_w.update(rw); cost.update(new)
+            routes_w.update(rw); cost.update(new); plen.update({x: _plen(v) for x, v in rw.items()})
             accepted.append({"move": name, "gain": round(gain, 4)})
             log(f"接受：{name}，代价 -{gain:.3f}")
             info = _info(inp, settings, orient, deltas)
@@ -537,14 +560,35 @@ def _optimize(inp, settings, log=None):
     total_inc = sum(cost.values())
     if accepted:
         final = _route_once(_posed(inp, orient), settings, (), deltas)   # 最终姿态下用完整参数联合重布
-        if final["ok"] and final["cost"] <= total_inc + 1e-9:
-            return _result(final, deltas, accepted, tried, first["cost"], log, time.time() - t0, orient), _posed(inp, orient), deltas
+        final_w = {x["id"]: x["points"] for x in _to_web_routes(final["meta"], final["routes"])} if final["ok"] else {}
+        if final["ok"] and final["cost"] <= total_inc + 1e-9 and within(final_w):
+            out = _result(final, deltas, accepted, tried, first["cost"], log, time.time() - t0, orient)
+            return _length_cap(out, inp, cap, log), _posed(inp, orient), deltas
         log(f"联合重布未更好（{final['cost']:.3f} ≥ {total_inc:.3f}），采用逐步移动的结果")
         out = _result(first, deltas, accepted, tried, first["cost"], log, time.time() - t0, orient)
         out.update(routes=[{"id": k, "code": next(r.get("code") for r in scope if r["id"] == k), "points": v}
                            for k, v in routes_w.items()], cost=round(total_inc, 4), metrics=None)
-        return out, _posed(inp, orient), deltas
-    return _result(first, deltas, accepted, tried, first["cost"], log, time.time() - t0), inp, {}
+        return _length_cap(out, inp, cap, log), _posed(inp, orient), deltas
+    return _length_cap(_result(first, deltas, accepted, tried, first["cost"], log, time.time() - t0), inp, cap, log), inp, {}
+
+
+def _plen(points):
+    """折线长度（网页坐标，米；与对方 routeMetrics 同一口径）。"""
+    return sum(math.dist(p, q) for p, q in zip(points, points[1:]))
+
+
+def _length_cap(out, inp, cap, log):
+    """全部管道折线总长（结果里的管用新路径，其余用原路径）超过 lengthCap 时判为不通过。"""
+    if not out["ok"] or cap == math.inf:
+        return out
+    new = {r["id"]: r["points"] for r in out["routes"]}
+    total = sum(_plen(new.get(r["id"], r["points"])) for r in inp["routes"])
+    out["length_m"] = round(total, 3)
+    if total > cap + 1e-6:
+        msg = f"管道总长 {total:.2f} m 超过允许值 {cap:.2f} m（没有找到不增加管长的改进）"
+        log(msg)
+        out.update(ok=False, violations=out["violations"] + [msg])
+    return out
 
 
 def _info(inp, settings, orient, deltas):

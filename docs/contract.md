@@ -185,7 +185,7 @@ layout-kernel-scene < 请求.json > 结果.json        # 或 python -m layout_ke
 - 场景（米制、Y 向上）：
   - `nodes`：每个节点 `{id, move, box, orientations: [{angle, swap, ports: {key: {position, normal}}, box, spools}]}`。`orientations[0]` 是当前姿态，其余是允许换成的朝向（设备旋转、三通换向与换口），每个朝向的端口已按该朝向算好；`move` 表示可以平移。
   - `routes`：每根管 `{id, code, points, segments: [{r}], from: {key}, to: {key}, leadA, leadB, fixed, low}`，可选 `weight_length / weight_bends / weight_height_changes`（本管权重倍数）。
-  - `radius`（每轴移动范围，米）、`seconds`（时间上限）。
+  - `radius`（每轴移动范围，米）、`seconds`（时间上限）、可选 `lengthCap`（全部管道折线总长上限，米，含范围外的管；只接受不超过上限的改进，最终仍超出则 `ok=false` 并说明）。
   - 可选区域：`equipment_keepout`、`pipe_keepout`（三维盒 `[x0,y0,z0,x1,y1,z1]`，米；是否生效由同名约束决定）。
 - 设置：`routing`（求解参数 + `constraints`）、`weights`、`scale`、`oblique_stub_mm`、`pipe_rules`、
   `rotation_candidates`（每个可转节点每轮真实重布几种朝向）、`lower_bound`（`{enabled, max_expansions}`）、

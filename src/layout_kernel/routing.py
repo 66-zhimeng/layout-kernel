@@ -178,14 +178,18 @@ class Grid:
         self.blocked = blocked.ravel().astype(np.uint8)
         self.eblocked = [e.ravel().astype(np.uint8) for e in eblocked]
         self.stride = (ny_ * nz_, nz_, 1)
+        self.spool_codes = {}                                          # 按所属节点分组的“只对该节点的管豁免”的晕
         for f in sc.fixed_routes.values():                             # 固定管路：其占用晕设为硬障碍
-            codes = halo_codes(self, sc, [{"points": [tuple(q) for q in f["points"]], "trim": f.get("trim", (False, False))}],
-                               f["D_mm"])
+            fr = {"points": [tuple(q) for q in f["points"]], "trim_nodes": tuple(f.get("trim_nodes", (None, None)))}
+            codes = halo_codes(self, sc, [fr], f["D_mm"], exempt=set())
+            for node in {x for x in fr["trim_nodes"] if x is not None}:
+                near = np.setdiff1d(codes, halo_codes(self, sc, [fr], f["D_mm"], exempt={node}))
+                self.spool_codes[node] = np.union1d(self.spool_codes.get(node, np.zeros(0, dtype=np.int64)), near)
+            codes = halo_codes(self, sc, [fr], f["D_mm"])              # 所有汇合处都去掉后的部分：对谁都是障碍
             for c in codes.tolist():
                 self.eblocked[c % 3][c // 3] = 1
-        self.spool_codes = {}                                          # 节点内部短管的占用晕，按所属节点分组
         for sp in sc.spools:
-            codes = halo_codes(self, sc, [{"points": [tuple(q) for q in sp["points"]], "trim": (False, False)}], sp["D_mm"])
+            codes = halo_codes(self, sc, [{"points": [tuple(q) for q in sp["points"]]}], sp["D_mm"])
             self.spool_codes[sp["owner"]] = np.union1d(self.spool_codes.get(sp["owner"], np.zeros(0, dtype=np.int64)), codes)
 
     def _open_range(self, a, lo, hi):
@@ -700,8 +704,9 @@ def tree_segments(branches, stats=None):
 
 
 # ============================================================ 占用晕
-def halo_codes(G, sc, branches, D=None):
+def halo_codes(G, sc, branches, D=None, exempt=None):
     """占用晕：与管道中心线（轴对齐盒）各轴距离都 < r_pp 的全部边，返回边编码 节点×3+轴 的有序数组。
+    exempt 见 clash_segments。
     条件在三个轴上可分离：垂直于边的轴看节点坐标，沿边的轴看边区间，各得一个布尔掩码，取笛卡尔积。"""
     if not sc.pp_on:                                                   # 不要求管间净距：不占用、不避让
         return np.zeros(0, dtype=np.int64)
@@ -710,7 +715,7 @@ def halo_codes(G, sc, branches, D=None):
     ny, nz = G.n[1], G.n[2]
     parts = []
     for br in branches:
-        for p, q in clash_segments(sc, br):
+        for p, q in clash_segments(sc, br, exempt):
             lo = [min(p[a], q[a]) for a in range(3)]
             hi = [max(p[a], q[a]) for a in range(3)]
             pm = [(C[b] - hi[b] < r) & (lo[b] - C[b] < r) for b in range(3)]
@@ -728,15 +733,30 @@ def halo_codes(G, sc, branches, D=None):
     return np.unique(np.concatenate(parts))
 
 
-def clash_segments(sc, br):
-    """参与管—管冲突判断的管段：在“无盒节点”（三通等汇合点）的端口处各去掉一段 r_pp。
-    几根管在同一个三通上汇合，口之间只隔几厘米，汇合处附近的相互接近由三通配件本身决定，不算冲突。"""
+def end_junctions(sc, br):
+    """支路 / 固定管路两端所接的无盒节点（三通等汇合点）：(起端节点或 None, 末端节点或 None)。"""
+    if "trim_nodes" in br:
+        return tuple(br["trim_nodes"])
+    if "start" in br:
+        a = br["start"][0] if sc.dev[br["start"][0]]["box"] is None else None
+        b = br["end"][1][0] if br["end"][0] == "port" and sc.dev[br["end"][1][0]]["box"] is None else None
+        return a, b
+    return None, None
+
+
+def clash_segments(sc, br, exempt=None):
+    """参与管—管冲突判断的管段：在“无盒节点”（三通等汇合点）的端口处去掉一段 r_pp。
+    几根管在同一个三通上汇合，口之间只隔几厘米，汇合处附近的相互接近由三通配件本身决定，不算冲突。
+    exempt = 对方管也接着的无盒节点集合：只在这些节点处去掉（豁免只在汇合于同一节点的两根管之间成立，
+    其他管靠近这里照常检查）。exempt 为 None 时所有无盒节点处都去掉（协商中的拥堵地图用，偏松，由校验与清理兜底）。"""
     segs = [(tuple(p), tuple(q)) for p, q in zip(br["points"], br["points"][1:])]
-    trim = br.get("trim") if sc.merge_exempt else (False, False)
-    if trim is None:
-        start = sc.dev[br["start"][0]]["box"] is None if "start" in br else False
-        end = br["end"][0] == "port" and sc.dev[br["end"][1][0]]["box"] is None if "end" in br else False
-        trim = (start, end)
+    nodes = end_junctions(sc, br)
+    if not sc.merge_exempt:
+        trim = (False, False)
+    elif exempt is None:
+        trim = (nodes[0] is not None, nodes[1] is not None)
+    else:
+        trim = (nodes[0] is not None and nodes[0] in exempt, nodes[1] is not None and nodes[1] in exempt)
     L = sc.r_pp
     for k, flag in ((0, trim[0]), (-1, trim[1])):
         if not flag or not segs:
@@ -1119,7 +1139,8 @@ def route_fixed(G, sc, routes, nid):
     """routes 中其他管网的占用晕设为硬障碍，不加拥堵代价，单独搜索 nid（扩展上限 cleanup_max_expansions）。
     返回 (支路或 None, 说明)。说明区分“搜索空间耗尽（当前网格与其他管道下确实无路）”与“超过扩展上限”。"""
     e = next(i for i, n in enumerate(sc.nets) if n["id"] == nid)
-    codes = [halo_codes(G, sc, brs, sc.net_param(other)["D"]) for other, brs in routes.items() if other != nid]
+    own = {dev for dev, _pn in sc.nets[e]["terms"]}
+    codes = [halo_codes(G, sc, brs, sc.net_param(other)["D"], exempt=own) for other, brs in routes.items() if other != nid]
     blocked = [(c // 3, c % 3) for c in (np.unique(np.concatenate(codes)).tolist() if codes else [])]
     saved = [(n, a, G.eblocked[a][n]) for n, a in blocked]
     for n, a in blocked:
@@ -1301,7 +1322,7 @@ def check_routes(sc, routes):
                         viol.append(f"{nid}：管段 {p}→{q} 进入管道禁区")
                 if (sc.z_ceiling is not None and full[5] > sc.z_ceiling + 1e-6) or max(p[2], q[2]) > npar["zc_max"] + 1e-6:
                     viol.append(f"{nid}：管段 {p}→{q} 超出高度范围")
-        all_boxes.append((nid, [_box(p, q, D / 2) for br in brs for p, q in clash_segments(sc, br)]))
+        all_boxes.append((nid, brs, D / 2))
         per_net[nid] = {"L_mm": L, "bends": bends, "height_changes": layers, "branches": len(brs)}
     for nid, brs in routes.items():                                    # 节点内部短管：接在该节点上的管只豁免首段与末段
         ends = {d for d, _p in net_of[nid]["terms"]}
@@ -1317,15 +1338,24 @@ def check_routes(sc, routes):
                         viol.append(f"{nid}：管段 {p}→{q} 穿过 {sp['owner']} 的内部短管")
                         break
     for fid, f in sc.fixed_routes.items():                             # 固定管路只参与净距，不计指标
-        pts = [tuple(q) for q in f["points"]]
-        all_boxes.append((fid, [_box(p, q, f["D_mm"] / 2) for p, q in
-                                clash_segments(sc, {"points": pts, "trim": f.get("trim", (False, False))})]))
+        all_boxes.append((fid, [{"points": [tuple(q) for q in f["points"]],
+                                 "trim_nodes": tuple(f.get("trim_nodes", (None, None)))}], f["D_mm"] / 2))
+    juncs = [{x for br in brs for x in end_junctions(sc, br) if x is not None} for _n, brs, _r in all_boxes]
+    cache = {}
+
+    def boxes(i, shared):
+        key = (i, frozenset(shared))
+        if key not in cache:
+            _n, brs, r = all_boxes[i]
+            cache[key] = [_box(p, q, r) for br in brs for p, q in clash_segments(sc, br, shared)]
+        return cache[key]
     for i in range(len(all_boxes)):
         for j in range(i + 1, len(all_boxes)):
             if not sc.pp_on or (all_boxes[i][0] in sc.fixed_routes and all_boxes[j][0] in sc.fixed_routes):
                 continue                                               # 两根都是给定的固定管路：不是本次求解的结果，不判
-            for bi in all_boxes[i][1]:
-                for bj in all_boxes[j][1]:
+            shared = juncs[i] & juncs[j]                               # 汇合豁免只在两根管共同接着的节点处成立
+            for bi in boxes(i, shared):
+                for bj in boxes(j, shared):
                     if _gap(bi, bj) < sc.gap_pp - 1e-6:
                         viol.append(f"{all_boxes[i][0]} 与 {all_boxes[j][0]}：管–管净距不足")
                         break
@@ -1334,10 +1364,11 @@ def check_routes(sc, routes):
                 break
     # 占地（设备 + 管道），长宽比补足
     dboxes = [d["box"] for d in sc.dev.values() if d["box"] is not None]
-    xs = [b[0] for b in dboxes] + [b[0] for _, bs in all_boxes for b in bs]
-    ys = [b[1] for b in dboxes] + [b[1] for _, bs in all_boxes for b in bs]
-    xe = [b[3] for b in dboxes] + [b[3] for _, bs in all_boxes for b in bs]
-    ye = [b[4] for b in dboxes] + [b[4] for _, bs in all_boxes for b in bs]
+    pboxes = [b for i in range(len(all_boxes)) for b in boxes(i, set())]
+    xs = [b[0] for b in dboxes] + [b[0] for b in pboxes]
+    ys = [b[1] for b in dboxes] + [b[1] for b in pboxes]
+    xe = [b[3] for b in dboxes] + [b[3] for b in pboxes]
+    ye = [b[4] for b in dboxes] + [b[4] for b in pboxes]
     W, H = max(xe) - min(xs), max(ye) - min(ys)
     k = sc.scale["kappa"]
     W, H = max(W, H / k), max(H, W / k)

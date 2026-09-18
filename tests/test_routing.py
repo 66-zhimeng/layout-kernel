@@ -347,3 +347,35 @@ def test_lower_bound_equals_cost_for_single_uncontested_net():
     total = sum(rt.net_cost(sc2, k, v) for k, v in per.items())
     lbs = rt.lower_bounds(sc2, 300000, 1)
     assert sum(v for v, _ in lbs.values()) <= total + 1e-9
+
+
+def test_merge_exemption_only_between_pipes_on_same_junction():
+    """三通（无盒节点）口附近的豁免只对接在同一个三通上的两根管成立；路过的第三根管照常检查净距。"""
+    dev = {"A": box(0, 0, 1000, 1000, ports={"p": (1000, 500, 500, 1, 0, 0)}),
+           "B": box(4000, 0, 1000, 1000, ports={"q": (4000, 500, 500, -1, 0, 0)}),
+           "J": {"box": None, "zones": [], "ports": {"a": (2000, 500, 500, -1, 0, 0), "b": (2100, 500, 500, 1, 0, 0)}},
+           "C": box(1550, -3000, 1000, 1000, ports={"r": (2050, -2000, 750, 0, 1, 0)}),
+           "D": box(1550, 3000, 1000, 1000, ports={"s": (2050, 3000, 750, 0, -1, 0)})}
+    nets = [{"id": "n1", "terms": [("A", "p"), ("J", "a")]}, {"id": "n2", "terms": [("J", "b"), ("B", "q")]},
+            {"id": "n3", "terms": [("C", "r"), ("D", "s")]}]
+    sc = scene(dev, nets, K=3)
+    routes = {"n1": [{"start": ("A", "p"), "end": ("port", ("J", "a")), "points": [(1000, 500, 500), (2000, 500, 500)]}],
+              "n2": [{"start": ("J", "b"), "end": ("port", ("B", "q")), "points": [(2100, 500, 500), (4000, 500, 500)]}],
+              "n3": [{"start": ("C", "r"), "end": ("port", ("D", "s")), "points": [(2050, -2000, 750), (2050, 3000, 750)]}]}
+    viol, _ = rt.check_routes(sc, routes)
+    pp = [v for v in viol if "管–管净距不足" in v]
+    assert not any("n1" in v and "n2" in v for v in pp)            # 汇合于 J 的两根管：口附近豁免
+    assert any("n3" in v for v in pp)                               # 路过 J 的管：不豁免
+
+
+def test_fixed_route_near_junction_blocks_other_pipes():
+    """固定管路在三通口附近的那段：只对接在该三通上的管豁免，其他管在网格里仍被挡住。"""
+    dev = {"J": {"box": None, "zones": [], "ports": {"a": (2000, 500, 500, -1, 0, 0)}},
+           "A": box(0, 0, 1000, 1000, ports={"p": (1000, 500, 500, 1, 0, 0)})}
+    nets = [{"id": "n1", "terms": [("A", "p"), ("J", "a")]}]
+    fixed = {"f": {"points": [(2000, 500, 500), (2000, 500, 2500)], "D_mm": 200, "trim_nodes": ("J", None)}}
+    sc = rt.Scene(dev, nets, {**RP, "constraints": cons(K=3)}, W, SCALE, fixed)
+    G = rt.Grid(sc)
+    near = G.spool_codes.get("J")
+    assert near is not None and near.size > 0                       # 口附近那段晕按节点 J 分组，不是全局放开
+    assert all(G.eblocked[c % 3][c // 3] == 0 for c in near.tolist())
