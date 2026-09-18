@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "layout-kernel"
+version = "0.1.0"
+description = "设备与管道自动排布计算内核：摆放、三维布管、协商消冲突与独立校验；约束全部由调用方配置"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {file = "LICENSE"}
+dependencies = [
+  "numpy>=2.0",
+  "scipy>=1.14",
+  "numba>=0.61",
+  "ortools>=9.10",
+  "networkx>=3.3",
+]
+
+[project.optional-dependencies]
+plot = ["matplotlib>=3.8"]
+test = ["pytest>=8.0"]
+
+[project.scripts]
+layout-kernel = "layout_kernel.__main__:main"
+layout-kernel-scene = "layout_kernel.scene_cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
