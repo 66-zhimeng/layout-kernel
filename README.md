@@ -1,113 +1,165 @@
+<div align="center">
+
 # layout-kernel
 
-设备与管道自动排布的计算内核：设备摆放、三维布管、多管协商消冲突、设备平移 / 旋转 / 三通换向优化、下界与差距报告，以及只看几何的独立校验器。
+**A computational kernel for automatic equipment and piping layout**
 
-- **约束全部由调用方配置。** 每条约束都有开关和参数（见 [docs/contract.md 第 5 节](docs/contract.md)），内核不写死约束，也不设默认值。
-- **结果以校验器为准。** 返回的违规和指标都来自独立校验器，不依赖求解器内部数据。
-- **启发式求解，附下界。** 给出可行且较优的方案；可报告在最终设备位置下离下界的最大差距（不是最优性证明）。
+Equipment placement · 3D orthogonal pipe routing · negotiated congestion resolution · equipment move / rotate / tee-port-swap optimization · lower bounds & gaps · independent validator
 
-研究过程（数学模型推导、各轮实验与失败记录）在 [math-problem-discussions](https://github.com/66-zhimeng/math-problem-discussions)，本仓库保留了其中内核部分的完整提交历史。
+**English** · [简体中文](README.zh-CN.md)
+
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.11%2B-3776AB.svg?logo=python&logoColor=white)](pyproject.toml)
+[![Tests](https://img.shields.io/badge/tests-62%20passed-brightgreen.svg)](tests)
+[![Numba](https://img.shields.io/badge/A*-numba%20compiled-00A3E0.svg)](src/layout_kernel/astar_fast.py)
+
+</div>
 
 ---
 
-## 安装
+## Why
 
-需要 Python 3.11+。建议装在独立虚拟环境里（`ortools` 会升级 `protobuf`，可能与其他项目冲突）：
+| | |
+|---|---|
+| 🎛️ **Every constraint is caller-configured** | 13 constraints, each with an explicit on/off switch and parameters. Nothing is hard-coded and there are no defaults: a missing setting is an error. |
+| ✅ **The validator is the source of truth** | Reported violations and metrics come from a geometry-only validator that is independent of the solver's internal state. |
+| 📉 **Heuristic, with a lower bound** | Returns a feasible, good layout plus the maximum gap to a lower bound at the final equipment positions. This is not an optimality proof, and the docs say so. |
+| 🔌 **Plugs into existing projects** | The scene interface takes the host project's equipment instances, ports, poses and current routes, and returns route polylines, equipment offsets and orientations. |
+
+## How it works
+
+```mermaid
+flowchart LR
+    A[Host scene<br/>equipment · ports · routes] --> B[Baseline<br/>current layout, kernel-validated]
+    B --> C{Pose negotiation<br/>optional}
+    C --> D[Candidate moves<br/>shift · rotate · swap<br/>evaluated in parallel]
+    D --> E[Joint re-route<br/>full parameters]
+    E --> F[Independent validator]
+    F --> G[Result + lower bound / gap]
+```
+
+- **Single-pipe routing**: A\* on a grid (numba-compiled, and identical case by case to a pure-Python reference). The search state tracks direction, straight run length and the number of elevation changes. Multiple starts and goals are supported, which lets one search choose between candidate poses.
+- **Multi-pipe negotiation**: PathFinder-style congestion pricing, run in parallel worker processes with a shared congestion map. A final cleanup pass re-routes each clashing pipe with all others held as hard obstacles.
+- **Pose negotiation**: when pipes at the same node pick different poses, the disagreement is priced like congestion, round after round, until the pipes agree.
+- **Equipment moves**: line-straightening, single alignment and re-orientation. Candidates are evaluated in parallel, and a batch of mutually independent improvements is accepted at once. A time limit is respected.
+
+## Install
+
+Python 3.11+. Use a dedicated virtual environment (`ortools` upgrades `protobuf`, which can clash with other projects):
 
 ```bash
 python -m venv .venv
 .venv/Scripts/python -m pip install "layout-kernel @ git+https://github.com/66-zhimeng/layout-kernel"
-# 开发：git clone 后 pip install -e ".[test,plot]"
+# development: git clone, then pip install -e ".[test,plot]"
 ```
 
-依赖：numpy、scipy、numba（单管 A* 的编译实现）、ortools（CP-SAT）、networkx。
+Dependencies: numpy, scipy, numba, ortools (CP-SAT), networkx.
 
-## 三种用法
+## Three ways to use it
 
-### 1. 任务书：摆放 + 布管，或只布管
+<details open>
+<summary><b>1. Task file: place + route, or route only</b></summary>
 
 ```python
 from layout_kernel import solve
 
-if __name__ == "__main__":                       # 摆放用多进程，必须放在这里
+if __name__ == "__main__":                       # placement uses multiprocessing
     result = solve("examples/case_small_plant.json")
     print(result["ok"], result["metrics"])
 ```
 
 ```bash
-layout-kernel examples/case_small_plant.json -o 方案.json
+layout-kernel examples/case_small_plant.json -o plan.json
 ```
 
-任务书给设备库、设备清单、管网拓扑和全部参数。`task.mode` 选 `place_and_route`（求设备位置 + 管道；多个候选摆放各布一次管，按真实指标选）或 `route_only`（设备位置已给定）。字段见 [docs/contract.md](docs/contract.md)。
+Set `task.mode` to `place_and_route` (find equipment positions and pipes) or `route_only` (positions are given). The fields are described in [docs/contract.md](docs/contract.md) (in Chinese).
+</details>
 
-### 2. 三维场景：接入已有项目
-
-已有项目自己管理设备实例、姿态、管路时，把当前场景交给内核，拿回管路折点和设备平移：
+<details>
+<summary><b>2. 3D scene: integrate with an existing project</b></summary>
 
 ```bash
-layout-kernel-scene < 请求.json > 结果.json
+layout-kernel-scene < request.json > result.json
 ```
 
-实际接入例子：拆件做网页（Three.js 系统管网页）的“布局内核”引擎，由其本机服务以子进程调用本命令；内核结果还要再过那个项目自己的实体校验才会被应用。
+The request holds nodes (bounding boxes, ports for each candidate orientation), routes (ends, current bends, outer diameter, straight necks) and settings (constraints, weights, time limit, and so on). The result holds new route polylines, equipment `offsets`, re-oriented nodes in `orientations`, and the lower bound and gap. See [docs/contract.md §7](docs/contract.md).
+</details>
 
-### 3. 直接调用布管器
+<details>
+<summary><b>3. Call the router directly</b></summary>
 
 ```python
 from layout_kernel import routing as rt
 
-sc = rt.Scene(DEVICES, NETS, ROUTING, WEIGHTS, SCALE)   # ROUTING 含 constraints
+sc = rt.Scene(DEVICES, NETS, ROUTING, WEIGHTS, SCALE)   # ROUTING includes "constraints"
 routes, history, G = rt.negotiate(sc)
 viol, metrics = rt.check_routes(sc, routes)
 ```
 
-完整可运行示例见 [examples/minimal_routing.py](examples/minimal_routing.py)，每个参数都有注释。
+A runnable, fully commented example is in [examples/minimal_routing.py](examples/minimal_routing.py).
+</details>
 
-## 约束开关
+## Constraint switches
 
-| 约束 | 含义 |
+| Constraint | Meaning |
 |---|---|
-| `pipe_pipe_clearance` | 不同管外壁之间的净距 |
-| `pipe_equipment_clearance` | 管与设备包围盒的净距 |
-| `self_clearance` | 同一根管沿管长相隔较远的两段之间的净距（防回绕、自交） |
-| `height_change_limit` | 每条支路高度变化次数上限 |
-| `ceiling` | 管顶最高标高 |
-| `service_zones` | 检修区下方不得走管 |
-| `straight_lengths` | 管件之间的最短直管 |
-| `low_pipes` | 低位管的中心线高度上限 |
-| `junction_merge_exemption` | 汇合于同一三通的管在口附近不算冲突 |
-| `internal_spools` | 三通内部短管是其他管的障碍 |
-| `equipment_spacing` | 移动设备时的设备间距 |
-| `equipment_keepout` | 设备禁区（区域在输入里给出） |
-| `pipe_keepout` | 管道禁区（区域在输入里给出） |
+| `pipe_pipe_clearance` | Clearance between the outer walls of different pipes |
+| `pipe_equipment_clearance` | Clearance between pipes and equipment boxes |
+| `self_clearance` | Clearance between distant segments of the same pipe |
+| `height_change_limit` | Maximum number of elevation changes per branch |
+| `ceiling` | Maximum top-of-pipe elevation |
+| `service_zones` | No pipes below maintenance zones |
+| `straight_lengths` | Minimum straight runs between fittings |
+| `low_pipes` | Centerline height limit for low-level pipes |
+| `junction_merge_exemption` | Two pipes meeting at the same tee don't clash near its ports (applies only to that pair) |
+| `internal_spools` | Tee internals and oblique stubs block other pipes |
+| `equipment_spacing` | Equipment spacing when moving equipment |
+| `equipment_keepout` | Equipment keep-out zones |
+| `pipe_keepout` | Pipe keep-out zones |
 
-每一条都要在配置里显式写 `"enabled": true/false`；参数与关闭时的含义见契约文档。
+Every constraint must state `"enabled": true/false`. Parameters and the meaning of "off" are in the contract doc.
 
-## 模块
+## On a real project
 
-| 模块 | 作用 |
+In a Three.js piping-network web app (230 pipes, 183 nodes), every kernel result must also pass the app's own solid-geometry validation before it is applied:
+
+| Scenario | Result | Time |
+|---|---|---|
+| Global optimization | bends 454 → ~340–370, length 2173 → ~2090 m | 60–300 s (configurable) |
+| Gap to lower bound | 1.4%–2.7% | bound ≈ 5 s |
+| Local (3 sensors) | bends 464 → 458, gap 0% | ≈ 8 s |
+
+> The gap is computed at the final equipment positions and orientations: each pipe's shortest route on its own, summed. It is not a global bound over equipment that can still move. Parallel negotiation varies slightly from run to run.
+
+## Modules
+
+| Module | Role |
 |---|---|
-| `constraints.py` | 约束注册表与配置校验 |
-| `routing.py` | 网格、A*、三通、协商布线、清理、独立校验器 |
-| `astar_fast.py` | 单管 A* 的 numba 实现（与 `routing.astar_py` 逐例一致，有测试保证） |
-| `scene.py` / `scene_cli.py` | 三维场景接口：每管管径与直颈、斜支口、固定管路、设备平移 / 旋转 / 换向优化、下界 |
-| `placement_sp.py` / `placement_cpsat.py` | 块级摆放（序列对 + LP + 并行退火 / CP-SAT）与摆放校验 |
-| `blocking.py` | 设备 → 块：模块识别、模块内部排法、聚簇 |
-| `api.py` / `contract.py` / `build.py` | 任务书接口、契约校验、模块间的粘合 |
-| `coarse_route.py` | 粗网格快速布管（秒级判断能否布下） |
+| `constraints.py` | Constraint registry and config validation |
+| `routing.py` | Grid, A\*, tees, negotiated routing, pose negotiation, cleanup, independent validator |
+| `astar_fast.py` | numba A\* for a single pipe (multi-start / multi-goal) |
+| `scene.py` / `scene_cli.py` | 3D scene interface: per-pipe diameter and necks, oblique stubs, fixed routes, move / rotate / swap optimization, lower bound |
+| `placement_sp.py` / `placement_cpsat.py` | Block placement (sequence pair + LP + parallel annealing / CP-SAT) and placement validation |
+| `blocking.py` | Equipment → blocks: module detection, intra-module arrangement, clustering |
+| `api.py` / `contract.py` / `build.py` | Task-file API, contract validation, glue |
+| `coarse_route.py` | Coarse-grid routing (feasibility in seconds) |
 
-## 测试
+## Tests
 
 ```bash
-.venv/Scripts/python -m pytest -q        # 56 个
+.venv/Scripts/python -m pytest -q        # 62 tests
 ```
 
-## 已知限制
+## Limitations
 
-- 管道只走网格线（间距可配置）；管径不同时，占用计算按最大管径保守处理。
-- 摆放只在平面内；场景优化中的设备移动为平移，朝向在调用方给出的候选朝向里选。
-- 启发式求解；下界只针对最终设备位置，多端点管网不给下界。
-- 示例算例为自拟数据；真实项目的接入例子见上文。
+- Pipes follow grid lines (the spacing is configurable). With mixed diameters, occupancy conservatively uses the largest diameter, and pipe sections are treated as squares.
+- Placement is planar. In scene optimization equipment only translates, and orientations are picked from the candidates the caller supplies.
+- Heuristic. The lower bound holds only for the final equipment positions, and none is given for multi-terminal nets.
 
-## 许可
+## Related
 
-Apache-2.0，见 [LICENSE](LICENSE)。
+The research history (model derivation, experiments, failures) lives in [math-problem-discussions](https://github.com/66-zhimeng/math-problem-discussions).
+
+## License
+
+[Apache-2.0](LICENSE)
