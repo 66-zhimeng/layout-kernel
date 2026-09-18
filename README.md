@@ -1,172 +1,111 @@
-# 设备与管道自动排布
+# layout-kernel
 
-给定设备清单与连接拓扑，自动安排**设备位置**与**管道走向**，在满足几何与工艺约束的前提下，优化占地、管长、弯头数与高度变化次数。
+设备与管道自动排布的计算内核：设备摆放、三维布管、多管协商消冲突、设备平移优化，以及只看几何的独立校验器。
 
-目前是**研究原型**：在一个 23 台设备、25 个管网的合成小冷站算例上，可以端到端跑出经独立校验器确认无违规的完整方案（摆放 60 s + 布管 13–21 s）。算例数据、设备库和布管参数数值均为自拟，尚未接入真实工程数据。
+- **约束全部由调用方配置。** 每条约束都有开关和参数（见 [docs/contract.md 第 5 节](docs/contract.md)），内核不写死约束，也不设默认值。
+- **结果以校验器为准。** 返回的违规和指标都来自独立校验器，不依赖求解器内部数据。
+- **启发式求解。** 给出可行且较优的方案，不附带最优性证明。
+
+研究过程（数学模型推导、各轮实验与失败记录）在 [math-problem-discussions](https://github.com/66-zhimeng/math-problem-discussions)，本仓库保留了其中内核部分的完整提交历史。
 
 ---
 
-## 1. 它能做什么
+## 安装
 
-| 能力 | 状态 |
-|---|---|
-| 块级摆放：序列对 + 线性规划定位，模拟退火搜索（12 进程） | 可用。60 s 预算下中位数比 CP-SAT 好约 2.9% |
-| 分块：模块识别（标注 + 自动）、模块内部排法、按连接关系聚簇 | 可用，仅在合成算例上验证 |
-| 精细布管：三维 A*，90° 弯头、最小直管长度、高度变化上限、三通、净距 | 可用，23 台设备算例 13–21 s |
-| 多根管冲突消解：协商布线（并行、共享拥堵图）+ 硬障碍清理 | 可用，B 类摆放 3 个种子全部零违规 |
-| 粗网格快速布管：秒级判断某个摆放能否布下 | 可用，约 1 s |
-| 独立校验器：只看折线几何，复核全部规则并给出指标 | 可用，所有结论以它为准 |
-| 摆放与布管的**联合**优化 | **未完成**，见第 6 节 |
-| CAD / BIM 接口，真实设备库 | **没有** |
-
-## 2. 安装
-
-需要 Python 3.11+。依赖装在仓库根目录的 `.venv`（不要装进全局环境，`ortools` 会升级全局 `protobuf`）。
+需要 Python 3.11+。建议装在独立虚拟环境里（`ortools` 会升级 `protobuf`，可能与其他项目冲突）：
 
 ```bash
 python -m venv .venv
-.venv/Scripts/python -m pip install -r 01_设备与管道自动排布/requirements.txt
+.venv/Scripts/python -m pip install "layout-kernel @ git+https://github.com/66-zhimeng/layout-kernel"
+# 开发：git clone 后 pip install -e ".[test,plot]"
 ```
 
-## 3. 快速开始
+依赖：numpy、scipy、numba（单管 A* 的编译实现）、ortools（CP-SAT）、networkx。
 
-### 3.0 统一接口（推荐）
+## 三种用法
 
-外部调用只走 `layout_kernel`：一份任务书 JSON 进，一份方案 JSON 出。字段见 **[layout_kernel/契约.md](layout_kernel/契约.md)**。
+### 1. 任务书：摆放 + 布管，或只布管
 
 ```python
 from layout_kernel import solve
 
-if __name__ == "__main__":                 # place_and_route 用多进程，必须加这一行
-    result = solve("layout_kernel/示例任务书_小冷站.json")
-    print(result["ok"], result["metrics"])          # 是否无违规、占地/管长/弯头/J
-    print(result["devices"]["CH1_主机"])            # 每台设备的位置与端口坐标
-    print(result["routes"]["冷却供水"])             # 每根管的折线（mm）
+if __name__ == "__main__":                       # 摆放用多进程，必须放在这里
+    result = solve("examples/case_small_plant.json")
+    print(result["ok"], result["metrics"])
 ```
-
-命令行：
 
 ```bash
-cd 01_设备与管道自动排布
-../.venv/Scripts/python -m layout_kernel layout_kernel/示例任务书_小冷站.json -o 方案.json
+layout-kernel examples/case_small_plant.json -o 方案.json
 ```
 
-任务书里 `task.mode` 二选一：
+任务书给设备库、设备清单、管网拓扑和全部参数。`task.mode` 选 `place_and_route`（求设备位置 + 管道；多个候选摆放各布一次管，按真实指标选）或 `route_only`（设备位置已给定）。字段见 [docs/contract.md](docs/contract.md)。
 
-- `place_and_route`：给拓扑和设备清单，求设备位置 + 管道。搜索 `candidates` 个候选摆放，**对每个候选完整布管**，按独立校验器算出的真实 J 选最好的。
-- `route_only`：设备位置已给定（每台设备的 `placed`），只布管。
+### 2. 三维场景：接入已有项目
 
-还可以在任务书里给：`params.weights`（各项权重）、设备的 `fixed`（钉死位置）、`keepout`（管道禁区）。
-
-下面两节是更贴近内部的用法，调试时用。
-
-### 3.1 只布管（设备位置已知，直接用布管模块）
+已有项目自己管理设备实例、姿态、管路时，把当前场景交给内核，拿回管路折点和设备平移：
 
 ```bash
-cd 01_设备与管道自动排布/布管原型
-../../.venv/Scripts/python 最小示例.py
+layout-kernel-scene < 请求.json > 结果.json
 ```
 
-[`最小示例.py`](布管原型/最小示例.py) 里是 3 台设备、2 个管网的完整输入，每个参数都有注释。核心只有三行：
+实际接入例子：拆件做网页（Three.js 系统管网页）的“布局内核”引擎，由其本机服务以子进程调用本命令；内核结果还要再过那个项目自己的实体校验才会被应用。
+
+### 3. 直接调用布管器
 
 ```python
-import routing as rt
+from layout_kernel import routing as rt
 
-sc = rt.Scene(DEVICES, NETS, ROUTING, WEIGHTS, SCALE)   # 声明场景
-routes, history, G = rt.negotiate(sc)                   # 布管（协商 + 清理）
-viol, metrics = rt.check_routes(sc, routes)             # 独立校验并算指标
+sc = rt.Scene(DEVICES, NETS, ROUTING, WEIGHTS, SCALE)   # ROUTING 含 constraints
+routes, history, G = rt.negotiate(sc)
+viol, metrics = rt.check_routes(sc, routes)
 ```
 
-输出：
+完整可运行示例见 [examples/minimal_routing.py](examples/minimal_routing.py)，每个参数都有注释。
 
-```
-布通 2/2，违规 0
-含管道占地 55.3 m²，管长 17.6 m，弯头 11，高度变化 4，J=7.47
-  供水 从 泵1.out：(1200,400,500)→(4200,400,500)→(4200,2100,500)→…→(5000,1200,800)
-```
+## 约束开关
 
-`routes` 是 `{管网 id: [支路, …]}`，每条支路给出折线点 `points`（毫米坐标），可直接交给下游建模。
+| 约束 | 含义 |
+|---|---|
+| `pipe_pipe_clearance` | 不同管外壁之间的净距 |
+| `pipe_equipment_clearance` | 管与设备包围盒的净距 |
+| `self_clearance` | 同一根管沿管长相隔较远的两段之间的净距（防回绕、自交） |
+| `height_change_limit` | 每条支路高度变化次数上限 |
+| `ceiling` | 管顶最高标高 |
+| `service_zones` | 检修区下方不得走管 |
+| `straight_lengths` | 管件之间的最短直管 |
+| `low_pipes` | 低位管的中心线高度上限 |
+| `junction_merge_exemption` | 汇合于同一三通的管在口附近不算冲突 |
+| `internal_spools` | 三通内部短管是其他管的障碍 |
+| `equipment_spacing` | 移动设备时的设备间距 |
 
-### 3.2 摆放 + 布管（端到端）
+每一条都要在配置里显式写 `"enabled": true/false`；参数与关闭时的含义见契约文档。
+
+## 模块
+
+| 模块 | 作用 |
+|---|---|
+| `constraints.py` | 约束注册表与配置校验 |
+| `routing.py` | 网格、A*、三通、协商布线、清理、独立校验器 |
+| `astar_fast.py` | 单管 A* 的 numba 实现（与 `routing.astar_py` 逐例一致，有测试保证） |
+| `scene.py` / `scene_cli.py` | 三维场景接口：每管管径与直颈、斜支口、固定管路、设备平移优化 |
+| `placement_sp.py` / `placement_cpsat.py` | 块级摆放（序列对 + LP + 并行退火 / CP-SAT）与摆放校验 |
+| `blocking.py` | 设备 → 块：模块识别、模块内部排法、聚簇 |
+| `api.py` / `contract.py` / `build.py` | 任务书接口、契约校验、模块间的粘合 |
+| `coarse_route.py` | 粗网格快速布管（秒级判断能否布下） |
+
+## 测试
 
 ```bash
-cd 01_设备与管道自动排布/分块原型
-../../.venv/Scripts/python 设备算例.py          # 生成算例 JSON
-cd ../布管原型
-../../.venv/Scripts/python 联合验证.py 60 3 B   # 摆放 60 s × 3 个种子，再布管
+.venv/Scripts/python -m pytest -q        # 51 个
 ```
 
-结果写入 `联合验证结果_B.json`，并输出每个种子的占地、管长、弯头、高度变化与 J。
+## 已知限制
 
-### 3.3 测试
+- 管道只走网格线（间距可配置）；管径不同时，占用计算按最大管径保守处理。
+- 设备优化只做平移，不改朝向；摆放只在平面内。
+- 启发式求解，不给最优性证明或下界。
+- 示例算例为自拟数据；真实项目的接入例子见上文。
 
-```bash
-cd 01_设备与管道自动排布 && ../.venv/Scripts/python -m pytest layout_kernel -q    # 16 个（接口与契约）
-cd 布管原型 && ../../.venv/Scripts/python -m pytest -q                           # 19 个（布管）
-cd ../分块原型 && ../../.venv/Scripts/python -m pytest -q                        # 12 个（分块）
-```
+## 许可
 
-## 4. 输入数据
-
-### 4.1 布管（`routing.Scene`）
-
-| 参数 | 说明 |
-|---|---|
-| `devices` | `{设备 id: {"box": (x0,y0,z0,x1,y1,z1), "zones": [(x0,y0,x1,y1), …], "ports": {端口名: (x,y,z,ux,uy,uz)}}}`。`zones` 是检修区平面矩形（高度由参数给出），`(ux,uy,uz)` 是管道离开端口时必须先直行的方向 |
-| `nets` | `[{"id": 名称, "terms": [(设备 id, 端口名), …]}]`，端点数 ≥ 3 时自动接三通 |
-| `rp` | 21 项布管参数：管径、弯曲半径系数、净距、高度变化上限 K、层高、检修区高度、网格间距、协商与清理的各项上限等 |
-| `weights` | 目标权重：`area`、`length`、`bends`、`height_changes` |
-| `scale` | 归一化尺度 `A0`、`L0`、`B0`、`C0`，长宽比上限 `kappa`，最小直管长度 `l_min_mm` |
-
-**参数不设默认值**：缺任何一项直接报 `KeyError`。这是刻意的——默认值会悄悄影响结果，而这里每个数值都对应工艺规定。
-
-### 4.2 摆放（`分块原型/设备算例.py` 生成的 JSON）
-
-包含设备类型库（外形、端口、检修区、高度）、设备清单、管网拓扑、以及 `params`（网格、设备间距、ℓ_min、长宽比、权重、布管参数、分块参数）。改数据就改这个脚本或直接改 JSON。
-
-## 5. 模块
-
-| 目录 / 文件 | 作用 |
-|---|---|
-| [`摆放原型/`](摆放原型/README.md) | 块级摆放。`placement_sp.py`（序列对 + LP + 并行退火）、`placement_cpsat.py`（CP-SAT 求解器与**独立校验器** `validate`） |
-| [`分块原型/`](分块原型/README.md) | 设备 → 块：模块识别、模块内部排法、聚簇；`设备算例.py` 生成算例 |
-| [`layout_kernel/`](layout_kernel/契约.md) | **对外接口**：契约校验（`contract.py`）、统一入口（`api.py`）、模块间的唯一粘合层（`build.py`）、命令行（`__main__.py`）、示例任务书与测试 |
-| [`布管原型/`](布管原型/README.md) | 布管。`routing.py`（网格、A*、三通、协商、清理、校验器）、`astar_fast.py`（A* 的 numba 实现）、`coarse_route.py`（粗网格快速布管）、`最小示例.py` |
-| [`对比实验/`](对比实验/实验报告.md) | 摆放求解器对比：SA、MILP、Z3、CP-SAT 及混合 |
-| [`自动排布数学模型-审查修订版.md`](自动排布数学模型-审查修订版.md) | 数学定义与目标函数，第 12 节为准 |
-| [`进度与下一步.md`](进度与下一步.md) | 交接文档：已确认的决定、全部实验结论（含失败的）、下一步 |
-
-## 6. 为什么摆放和布管是两个模块
-
-两者确实共同决定最终结果，目标函数也只有一个：
-
-```
-J = w_A · 占地/A₀ + w_L · 管长/L₀ + w_B · 弯头/B₀ + w_C · 高度变化/C₀
-```
-
-分成两个模块是**实现上的分工**，不是假设它们互不影响：
-
-- 两者的求解结构完全不同。摆放是离散的相对位置关系（哪台在哪台左边）加连续坐标，用序列对 + 线性规划；布管是三维网格上的路径搜索，状态里还带着方向、直管长度、高度变化次数。放在一个求解器里，规模会直接爆炸。
-- 分开以后每一层都能单独验证：摆放结果由 `placement_cpsat.validate` 评分，布管结果由 `routing.check_routes` 复核，互相独立。
-
-**耦合目前是这样处理的**（诚实地说，还不够）：
-
-1. 摆放时按每个侧面的出管数量预留空间（方法 B），保证管道有地方走；
-2. 粗网格布管（约 1 s）可以在摆放阶段判断某个方案能不能布下；
-3. 布管结果反过来影响摆放的尝试，做过五次，**都没有改进**：穿行容量估计、走廊引导、按粗网格长度调管网权重、接入顺序、主干 + 分支估计。原因一致——估计公式只反映管长的一部分，而目标里管长、占地、弯头互相牵制，改一项就被另一项抵消。详见各原型 README 与交接文档。
-
-**现在的做法**：单管 A* 改成编译实现后，完整布管只要 13–21 s，比一次摆放搜索（60 s）便宜。所以 `layout_kernel` 直接对多个候选摆放各布一次管，按**真实的 J**（独立校验器算出来的）选，不再拟合估计公式。这是耦合的第一步；把布管结果反馈进摆放搜索内部仍未实现。
-
-## 7. 已知限制
-
-- 管道截面按边长 D 的正方形处理（比圆管保守）；管长按中心线折线计，不扣弯曲弧长。
-- 三通按点处理，未实现斜三通；同一管网内部各支路之间不检查净距。
-- 所有管网同径，未实现变径段。
-- 检修区按"占地矩形之外"处理，摆放侧用的是充分条件，会排除一些合法布局。
-- 自动合并模块（`blocking.auto_module_policy = "accept"`）会让布管明显变难：模块内部没有为出管留空间。实测 6 个候选全部有违规，不合并时最终方案零违规。建议先用 `report_only`。
-- 并行协商带随机性：同一摆放重复运行，用时与管长会有波动（用时 ±30%）。
-- 仅在 23 台设备的合成算例上端到端验证；550 台设备的大算例只跑过摆放，没跑过布管。
-
-## 8. 许可
-
-见仓库根目录 [LICENSE](../LICENSE)。
+Apache-2.0，见 [LICENSE](LICENSE)。
