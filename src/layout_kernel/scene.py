@@ -17,6 +17,9 @@ settings（全部必填）：
   candidate_routing：评估候选移动时覆盖的求解参数（只需快速判断能否布下与代价，不必用出最终方案的完整强度），
     例如 {"max_iters": 15, "stall_iters": 4, "max_expansions": 300000, "cleanup_max_expansions": 200000}；
     基准与最终方案仍用 routing 里的完整参数
+  pose_negotiation：姿态协商（见 _pose_negotiate）{"enabled": bool, "max_poses": 每个节点除当前外最多几个候选姿态,
+    "pres_bends": 每有一根同节点的管选了别的姿态，附加多少个弯头当量（随协商轮次按 pres_fac_mult 增长）,
+    "hist_bends": 姿态不一致时每轮累积的历史价（弯头当量）}
   pipe_rules：对方的直管规则，用来推算每根管的 rho / lead（见 _straight_rules）：
     {"trim_ratio": 弯头最多占相邻直管的比例, "radius_margin_mm": 有效弯曲半径须超过管半径的量,
      "port_margin_mm": 端口直颈之外的余量, "safety": 放大系数,
@@ -26,12 +29,14 @@ settings（全部必填）：
 返回：{"ok", "violations", "metrics", "routes": [{id, code, points}]（米制、Y 向上，含两端端口）, "timing"}
 """
 import math
+import re
 import time
 
 from . import constraints
 from . import routing as rt
 SETTINGS_REQUIRED = ["routing", "weights", "scale", "oblique_stub_mm", "pipe_rules", "rotation_candidates", "lower_bound",
-                     "candidate_routing"]
+                     "candidate_routing", "pose_negotiation"]
+POSE_REQUIRED = ["enabled", "max_poses", "pres_bends", "hist_bends"]
 SERIAL_NETS = 8                                                 # 每个并行进程至少分到的管数
 RULES_REQUIRED = ["trim_ratio", "radius_margin_mm", "port_margin_mm", "safety", "rule_D_mm", "rule_R_mm"]
 
@@ -105,10 +110,13 @@ def _oblique_stub(port_w, normal_w, baseline_points, stub_mm):
     return to_k(exact), tuple(out), exact
 
 
-def build_scene(inp, settings, fixed_ids=(), deltas=None):
+def build_scene(inp, settings, fixed_ids=(), deltas=None, ghosts=None, alts=None):
     """网页优化输入 → routing.Scene。返回 (Scene, 元数据)。fixed_ids 中的管保持原路径，作为障碍。
     deltas = {节点 id: [dX, dY, dZ]}（网页坐标，米、Y 向上）：该节点的端口与包围盒整体平移。平移过的节点，
-    其斜向端口不再沿用基线里的斜段，按法向重新伸出。"""
+    其斜向端口不再沿用基线里的斜段，按法向重新伸出。
+    姿态协商用：ghosts = {虚拟节点: 真实节点}（候选姿态，只提供端口，不是障碍，其端口可穿过真实节点当前的盒）；
+    alts = {端口 key: [(虚拟端口 key, 姿态序号), ...]}：接在该端口上的管两端可改接这些候选端口。"""
+    ghosts, alts = ghosts or {}, alts or {}
     deltas = deltas or {}
     miss = [k for k in SETTINGS_REQUIRED if k not in settings]
     if miss:
@@ -129,6 +137,8 @@ def build_scene(inp, settings, fixed_ids=(), deltas=None):
             box = _box_k({"min": [o["box"]["min"][i] + dw[i] for i in range(3)],
                           "max": [o["box"]["max"][i] + dw[i] for i in range(3)]})
         devices[n["id"]] = {"box": box, "zones": [], "ports": {}}
+        if n["id"] in ghosts:
+            devices[n["id"]].update(ghost=True, pass_owner=ghosts[n["id"]])
         for key, p in o["ports"].items():
             port_owner[key] = n["id"]
             port_w[key] = {"position": [p["position"][i] + dw[i] for i in range(3)], "normal": p["normal"]} if d else p
@@ -154,17 +164,32 @@ def build_scene(inp, settings, fixed_ids=(), deltas=None):
         if r["id"] in fixed_ids or r.get("fixed"):
             ends = [port_owner[r[k]["key"]] if devices[port_owner[r[k]["key"]]]["box"] is None else None
                     for k in ("from", "to")]
-            fixed[r["id"]] = {"points": [to_k(q) for q in r["points"]], "D_mm": round(D, 1), "trim_nodes": ends}
+            fixed[r["id"]] = {"points": [to_k(q) for q in r["points"]], "D_mm": round(D, 1), "trim_nodes": ends,
+                              "ends": [port_owner[r[k]["key"]] for k in ("from", "to")]}
             continue
         ka, kb = r["from"]["key"], r["to"]["key"]
-        ins = [_inside_mm(devices[port_owner[k]], k) if k not in stubs else 0.0 for k in (ka, kb)]
-        leads = [_lead_with_inside(1000 * r[f], i, D, settings["pipe_rules"], cons_cfg) for f, i in (("leadA", ins[0]), ("leadB", ins[1]))]
-        rho, lmin, ps = _straight_rules(leads, settings["pipe_rules"])
-        ps_a, ps_b = (ps[0] - ins[0], ps[1] - ins[1])                # 布管器另行加上盒内长度，这里扣掉避免重复
+
+        def port_straight(k, lead):                             # 布管器另行加上盒内长度，这里扣掉避免重复
+            i = _inside_mm(devices[port_owner[k]], k) if k not in stubs else 0.0
+            return _straight_rules([_lead_with_inside(lead, i, D, settings["pipe_rules"], cons_cfg)],
+                                   settings["pipe_rules"])[2][0] - i
+        rho, lmin, _ps = _straight_rules([0.0], settings["pipe_rules"])
+        la, lb = 1000 * r["leadA"], 1000 * r["leadB"]
+        pst = {k_: port_straight(k_, ld) for k_, ld in ((ka, la), (kb, lb)) if k_ not in stubs}
         net = {"id": r["id"], "terms": [(port_owner[ka], ka), (port_owner[kb], kb)],
                "D_mm": round(D, 1), "rho_mm": rho, "lead_mm": lmin,
                **{k: r[k] for k in ("weight_length", "weight_bends", "weight_height_changes") if k in r},
-               "port_straight_mm": {k_: v for k_, v in ((ka, ps_a), (kb, ps_b)) if k_ not in stubs}}
+               "port_straight_mm": pst}
+        if ka in alts or kb in alts:
+            sides = []
+            for k_, ld in ((ka, la), (kb, lb)):
+                side = [((port_owner[k_], k_), (port_owner[k_], 0))]
+                for vk, pose in alts.get(k_, ()):
+                    side.append(((port_owner[vk], vk), (port_owner[k_], pose)))
+                    if vk not in stubs:
+                        pst[vk] = port_straight(vk, ld)
+                sides.append(side)
+            net["alts"] = sides
         if r.get("low") and cons_cfg["low_pipes"]["enabled"]:
             net["zc_max_mm"] = cons_cfg["low_pipes"]["zc_max_mm"]
         nets.append(net)
@@ -191,7 +216,7 @@ def build_scene(inp, settings, fixed_ids=(), deltas=None):
             if key in stubs:
                 a, b = port_w[key]["position"], stubs[key]
                 n = max(1, math.ceil(1000 * math.dist(a, b) / (D / 2)))
-                spools.append({"owner": port_owner[key], "D_mm": round(D, 1),
+                spools.append({"owner": port_owner[key], "pipe": r["id"], "D_mm": round(D, 1),
                                "points": [to_k([a[i] + (b[i] - a[i]) * k / n for i in range(3)]) for k in range(n + 1)]})
     # 并行进程各自要建一遍网格：管少时并行不划算，按每进程至少 SERIAL_NETS 根管分配
     rp["route_workers"] = max(1, min(rp["route_workers"], len(nets) // SERIAL_NETS))
@@ -243,6 +268,8 @@ def _moved_violations(sc, deltas):
             if oid != nid and rt._gap(b, ob) < c["gap_mm"] - 1e-6:
                 out.append(f"移动后 {nid} 与 {oid} 设备间距不足")
         for fid, f in sc.fixed_routes.items():
+            if nid in f.get("ends", ()):                                # 接在本设备上的管：布它时已查过与设备的净距
+                continue
             pts = [tuple(q) for q in f["points"]]
             for p, q in zip(pts, pts[1:]):
                 if rt._gap(rt._box(p, q, f["D_mm"] / 2), b) < sc.gap_ep - 1e-6:
@@ -257,7 +284,11 @@ def _route_once(inp, settings, fixed_ids=(), deltas=None, log=None):
     if moved_viol:                                                   # 移动本身不合法：不必布管
         return {"sc": sc, "meta": meta, "routes": {}, "viol": moved_viol, "met": {"per_net": {}}, "ok": False,
                 "cost": math.inf, "history": [{}], "G": None}
-    routes, history, G = rt.negotiate(sc, log=log or (lambda _l: None))
+    try:
+        routes, history, G = rt.negotiate(sc, log=log or (lambda _l: None))
+    except rt.OffGrid as ex:                                         # 移动后端口超出布管空间（如高过顶棚）：不可行
+        return {"sc": sc, "meta": meta, "routes": {}, "viol": [f"端口超出布管范围：{ex}"], "met": {"per_net": {}},
+                "ok": False, "cost": math.inf, "history": [{}], "G": None}
     viol, met = rt.check_routes(sc, routes)
     ok = not viol and len(routes) == len(sc.nets)
     cost = sum(rt.net_cost(sc, nid, v) for nid, v in met["per_net"].items())
@@ -295,7 +326,7 @@ def route_scene(inp, settings, fixed_ids=(), log=None):
     r = _route_once(inp, settings, fixed_ids, None, log)
     return {"ok": r["ok"], "violations": r["viol"],
             "metrics": {k: v for k, v in r["met"].items() if k != "per_net"},
-            "routes": _to_web_routes(r["meta"], r["routes"]), "offsets": {}, "grid_nodes": r["G"].size,
+            "routes": _to_web_routes(r["meta"], r["routes"]), "offsets": {}, "grid_nodes": r["G"].size if r["G"] is not None else None,
             "iterations": len(r["history"]), "timing": {"route_s": round(time.time() - t0, 1)}}
 
 
@@ -489,6 +520,42 @@ def _optimize(inp, settings, log=None):
     cost = _net_costs(first)
     orient, deltas, tried, accepted = {}, {}, 0, []
     info = first["meta"] | {"sc": first["sc"]}
+    full = None                                                    # 与当前姿态一致的完整重布结果（有则最终不必再重布）
+    pcfg = settings["pose_negotiation"]
+    miss = [k for k in POSE_REQUIRED if not isinstance(pcfg, dict) or k not in pcfg]
+    if miss:
+        raise KeyError(f"pose_negotiation 缺少 {miss}（不设默认值）")
+    if pcfg["enabled"] and (movable and radius > 0 or rotatable):
+        now = _shifted(_posed(inp, orient), deltas)
+        poses = _pose_sets(now, info, movable, rotatable, radius, orient, deltas, settings)
+        picked = _pose_negotiate(inp, settings, orient, deltas, poses, log) if poses else {}
+        if picked:
+            n_orient = {**orient, **{nid: o for nid, (o, _d) in picked.items()}}
+            n_deltas = {**deltas, **{nid: d for nid, (_o, d) in picked.items()}}
+            n_deltas = {k: v for k, v in n_deltas.items() if any(abs(x) > 1e-9 for x in v)}
+            r = _route_once(_posed(inp, n_orient), settings, (), n_deltas)
+            for _retry in range(2):                                # 个别节点按正式规则布不通：退回原姿态再试
+                if r["ok"] or not picked:
+                    break
+                bad = _violating_nodes(inp, r["viol"]) & set(picked)
+                if not bad:
+                    break
+                log(f"姿态协商方案有 {len(r['viol'])} 条违规，{len(bad)} 个相关节点退回原姿态后重试")
+                picked = {k: v for k, v in picked.items() if k not in bad}
+                n_orient = {**orient, **{nid: o for nid, (o, _d) in picked.items()}}
+                n_deltas = {k: v for k, v in {**deltas, **{nid: d for nid, (_o, d) in picked.items()}}.items()
+                            if any(abs(x) > 1e-9 for x in v)}
+                r = _route_once(_posed(inp, n_orient), settings, (), n_deltas)
+            if picked and r["ok"] and r["cost"] < first["cost"] - 1e-9:
+                orient, deltas, full = n_orient, n_deltas, r
+                routes_w = {x["id"]: x["points"] for x in _to_web_routes(r["meta"], r["routes"])}
+                cost = _net_costs(r)
+                accepted.append({"move": f"姿态协商：{len(picked)} 个节点换姿态", "gain": round(first["cost"] - r["cost"], 4)})
+                info = r["meta"] | {"sc": r["sc"]}
+                log(f"姿态协商方案按正式规则重布通过，代价 {first['cost']:.3f} → {r['cost']:.3f}（{time.time() - t0:.1f} s）")
+            else:
+                log("姿态协商方案未采用：" + (f"代价 {r['cost']:.3f} 不优于 {first['cost']:.3f}" if r["ok"]
+                                         else "按正式规则重布有违规：" + "；".join(r["viol"][:3])))
     workers = int(settings["routing"]["route_workers"])
     pool = None
     try:
@@ -538,6 +605,7 @@ def _optimize(inp, settings, log=None):
                     if gain > 1e-9:
                         good.append((gain, k, new, rw))
             if not good:
+                log(f"本轮 {len(results)} 个候选都没有改进（其中可布通 {sum(1 for x in results if x[1])} 个）")
                 break
             good.sort(key=lambda g: -g[0])
             batch, used_n, used_p = [], set(), set()
@@ -559,6 +627,7 @@ def _optimize(inp, settings, log=None):
                 _k, ok, new, rw = _ev_one((0, trial, trial_orient, frozenset(inc_all), routes_w))
                 gain = sum(cost[x] for x in inc_all) - sum(new[x] for x in inc_all) if ok else -math.inf
                 if ok and gain > batch[0][0] - 1e-9:
+                    full = None
                     deltas, orient = trial, trial_orient
                     routes_w.update(rw); cost.update(new)
                     for g in batch:
@@ -568,6 +637,7 @@ def _optimize(inp, settings, log=None):
                     continue
                 batch = batch[:1]
             gain, k, new, rw = batch[0]
+            full = None
             name = meta[k][0]
             deltas, orient = tasks[k][1], tasks[k][2]
             routes_w.update(rw); cost.update(new)
@@ -578,6 +648,8 @@ def _optimize(inp, settings, log=None):
         if pool is not None:
             pool.shutdown(wait=True, cancel_futures=True)
     total_inc = sum(cost.values())
+    if full is not None:                                           # 最后一次接受的就是完整重布的结果
+        return _result(full, deltas, accepted, tried, first["cost"], log, time.time() - t0, orient), _posed(inp, orient), deltas
     if accepted and time.time() - t0 > limit:
         log("到达时间上限，跳过最终联合重布，采用逐步移动的结果")
     if accepted and time.time() - t0 <= limit:
@@ -624,7 +696,7 @@ def _result(r, deltas, accepted, tried, base_cost, log, seconds=0.0, orient=None
             "moves": accepted, "candidates_tried": tried,
             "base_cost": round(base_cost, 4) if base_cost < math.inf else None,
             "cost": round(r["cost"], 4) if r["cost"] < math.inf else None,
-            "iterations": len(r["history"]), "grid_nodes": r["G"].size,
+            "iterations": len(r["history"]), "grid_nodes": r["G"].size if r["G"] is not None else None,
             "timing": {"route_s": round(seconds, 1)}}
 
 
@@ -636,6 +708,31 @@ def _posed(inp, orient):
         o = orient.get(n["id"], 0)
         nodes.append({**n, "_all": allo, "orientations": [allo[o]] + [x for i, x in enumerate(allo) if i != o]})
     return {**inp, "nodes": nodes}
+
+
+def _pose_est(ori, d, pipes, exact, kdir, w, sc):
+    """节点取朝向 ori、平移 d（网页坐标，相对原始位置）时，相连各管的代价估计：端口间曼哈顿距离 + 至少几个弯。
+    pipes = [(本节点端口, 对端端口)]；对端按当前位置（exact：网页坐标，斜口取斜段终点；kdir：内核出管方向）。"""
+    est = 0.0
+    for mine, other in pipes:
+        if other not in exact or mine not in ori["ports"]:
+            return math.inf
+        pw = [ori["ports"][mine]["position"][i] + d[i] for i in range(3)]
+        q = exact[other]
+        man = 1000 * sum(abs(pw[i] - q[i]) for i in range(3))
+        dp = _axis_dir(ori["ports"][mine]["normal"], mine)
+        dq = kdir.get(other)
+        if dp is None or dq is None:
+            b = 1
+        else:
+            dpk, dqk = tuple(dp), tuple(dq)
+            ax = [i for i in range(3) if dpk[i]][0]
+            pk, qk = to_k(pw), to_k(q)
+            facing = dpk == tuple(-v for v in dqk) and all(abs(pk[i] - qk[i]) < 0.5 for i in range(3) if i != ax) \
+                and (qk[ax] - pk[ax]) * dpk[ax] > 0
+            b = 0 if facing else (1 if dpk[ax] == 0 or dqk[ax] == 0 else 2)
+        est += w["length"] * man / sc["L0"] + w["bends"] * b / sc["B0"]
+    return est
 
 
 def _rotation_candidates(inp, meta0, rotatable, orient, deltas, settings, top):
@@ -654,33 +751,127 @@ def _rotation_candidates(inp, meta0, rotatable, orient, deltas, settings, top):
                  for r in inp["routes"] if not r.get("fixed") and nid in (owner[r["from"]["key"]], owner[r["to"]["key"]])]
         if not pipes:
             continue
-        ests = []
-        for o, ori in enumerate(n["_all"]):
-            est = 0.0
-            for mine, other in pipes:
-                if other not in exact or mine not in ori["ports"]:
-                    est = math.inf
-                    break
-                pw = [ori["ports"][mine]["position"][i] + d[i] for i in range(3)]
-                q = exact[other]
-                man = 1000 * sum(abs(pw[i] - q[i]) for i in range(3))
-                dp = _axis_dir(ori["ports"][mine]["normal"], mine)
-                dq = kdir.get(other)
-                if dp is None or dq is None:
-                    b = 1
-                else:
-                    dpk, dqk = tuple(dp), tuple(dq)
-                    ax = [i for i in range(3) if dpk[i]][0]
-                    pk, qk = to_k(pw), to_k(q)
-                    facing = dpk == tuple(-v for v in dqk) and all(abs(pk[i] - qk[i]) < 0.5 for i in range(3) if i != ax) \
-                        and (qk[ax] - pk[ax]) * dpk[ax] > 0
-                    b = 0 if facing else (1 if dpk[ax] == 0 or dqk[ax] == 0 else 2)
-                est += w["length"] * man / sc["L0"] + w["bends"] * b / sc["B0"]
-            ests.append((est, o))
+        ests = [(_pose_est(ori, d, pipes, exact, kdir, w, sc), o) for o, ori in enumerate(n["_all"])]
         cur = orient.get(nid, 0)
         for est, o in sorted(ests)[:top + 1]:
             if o != cur and est < math.inf:
                 out.append((f"{nid} 换成朝向 {o}（估计 {est:.2f}）", {nid: (0.0, 0.0, 0.0)}, {nid: o}))
+    return out
+
+
+def _pose_sets(now, info, movable, rotatable, radius, orient, deltas, settings):
+    """每个可动节点的候选姿态 [(朝向下标, 平移)]，第 0 个是当前姿态。候选来自换朝向（原位）与平移候选
+    （串联拉直、单个对齐拆到各节点），按 _pose_est 估计排序取前 max_poses 个；单独看就违反设备间距 / 设备禁区的去掉。"""
+    cfg = settings["pose_negotiation"]
+    cons_cfg = constraints.validate(settings["routing"]["constraints"])
+    sp = cons_cfg["equipment_spacing"]
+    boxes = {did: d["box"] for did, d in info["sc"].dev.items() if d["box"] is not None}
+    keepout = [_box_k({"min": b[:3], "max": b[3:]}) for b in now.get("equipment_keepout", [])] \
+        if cons_cfg["equipment_keepout"]["enabled"] else []
+    owner = {k: n["id"] for n in now["nodes"] for k in n["orientations"][0]["ports"]}
+    exact = {k: (info["stubs"].get(k) or p["position"]) for k, p in info["port_w"].items()}
+    kdir = {k: v[3:] for dev in info["sc"].dev.values() for k, v in dev["ports"].items()}
+    w, scl = settings["weights"], settings["scale"]
+    nodes = {n["id"]: n for n in now["nodes"]}
+    trans = {}
+    for _name, move in (_candidates(now, info, movable, radius) if movable and radius > 0 else []):
+        for nid, d in move.items():
+            trans.setdefault(nid, set()).add(tuple(d))
+
+    top = info["sc"].z_ceiling - info["sc"].D / 2 if info["sc"].z_ceiling is not None else math.inf
+
+    def fits(nid, ori, d):
+        if any(1000 * (p_["position"][1] + d[1]) > top + 1e-6 for p_ in ori["ports"].values()):
+            return False                                           # 端口高过顶棚：不在布管空间内
+        if not ori.get("box"):
+            return True
+        b = _box_k({"min": [ori["box"]["min"][i] + d[i] for i in range(3)], "max": [ori["box"]["max"][i] + d[i] for i in range(3)]})
+        if any(rt._gap(b, k) < -1e-6 for k in keepout):
+            return False
+        return not sp["enabled"] or all(rt._gap(b, ob) >= sp["gap_mm"] - 1e-6 for oid, ob in boxes.items() if oid != nid)
+    out = {}
+    for nid in dict.fromkeys(list(movable) + list(rotatable)):
+        n = nodes[nid]
+        pipes = [(r["from"]["key"], r["to"]["key"]) if owner[r["from"]["key"]] == nid else (r["to"]["key"], r["from"]["key"])
+                 for r in now["routes"] if not r.get("fixed") and nid in (owner[r["from"]["key"]], owner[r["to"]["key"]])]
+        if not pipes:
+            continue
+        o0, d0 = orient.get(nid, 0), tuple(deltas.get(nid, (0.0, 0.0, 0.0)))
+        cands = [(o, d0) for o in range(len(n["_all"])) if o != o0] if nid in rotatable else []
+        for dd in trans.get(nid, ()):
+            d = tuple(d0[i] + dd[i] for i in range(3))
+            if all(abs(v) <= radius + 1e-9 for v in d):
+                cands.append((o0, d))
+        scored = sorted((_pose_est(n["_all"][o], d, pipes, exact, kdir, w, scl), o, d) for o, d in cands)
+        keep = [(o, d) for est, o, d in scored if est < math.inf and fits(nid, n["_all"][o], d)][:cfg["max_poses"]]
+        if keep:
+            out[nid] = [(o0, d0)] + keep
+    return out
+
+
+def _pose_negotiate(inp, settings, orient, deltas, poses, log):
+    """姿态协商：把每个节点的候选姿态做成虚拟节点（端口 + 内部短管；包围盒不是障碍），每根管在两端的候选端口间一次搜索，
+    同一节点各管的姿态分歧按拥堵的办法逐轮加价（routing.negotiate），直到一致。返回 {节点: (朝向, 平移)}（只含换了的）。
+    只用来选姿态：选定后由调用方按正式规则（设备盒、内部短管、完整参数）重布并校验。"""
+    cfg = settings["pose_negotiation"]
+    base = _posed(inp, orient)
+    byid = {n["id"]: n for n in base["nodes"]}
+    nodes, ghosts, alts = list(base["nodes"]), {}, {}
+    for nid, plist in poses.items():
+        for k, (o, d) in enumerate(plist):
+            if k == 0:
+                continue
+            ori, vid = byid[nid]["_all"][o], f"{nid}#{k}"
+            box = ({"min": [ori["box"]["min"][i] + d[i] for i in range(3)], "max": [ori["box"]["max"][i] + d[i] for i in range(3)]}
+                   if ori.get("box") else None)
+            nodes.append({"id": vid, "move": False, "orientations": [{
+                "ports": {f"{key}#{k}": {"position": [p["position"][i] + d[i] for i in range(3)], "normal": p["normal"]}
+                          for key, p in ori["ports"].items()}, "box": box,
+                "spools": [[[q[i] + d[i] for i in range(3)] for q in seg] for seg in ori.get("spools") or []]}]})
+            ghosts[vid] = nid
+            for key in ori["ports"]:
+                alts.setdefault(key, []).append((f"{key}#{k}", k))
+    pose_settings = {**settings, "routing": {**settings["routing"], **settings["candidate_routing"]}}
+    sc, _meta = build_scene({**base, "nodes": nodes}, pose_settings, (), deltas, ghosts, alts)
+    sc.pose_cfg = cfg
+    try:
+        routes, history, _G = rt.negotiate(sc, log=lambda _l: None, cleanup_enabled=False)
+    except rt.OffGrid as ex:
+        log(f"姿态协商跳过：候选姿态的端口超出布管范围（{ex}）")
+        return {}
+    alt = {n["id"]: {tuple(t): pose for side in n.get("alts", ()) for t, pose in side} for n in sc.nets}
+    votes = {}
+    for nid, brs in routes.items():
+        if not alt.get(nid):
+            continue
+        for t in (tuple(brs[0]["start"]), tuple(brs[0]["end"][1])):
+            node, k = alt[nid][t]
+            if node in poses:
+                votes.setdefault(node, {}).setdefault(k, 0)
+                votes[node][k] += 1
+    picked = {}
+    for node, v in votes.items():
+        k = max(v, key=lambda x: (v[x], x == 0))                        # 多数；平票取当前姿态
+        if k != 0:
+            picked[node] = poses[node][k]
+    split = sum(1 for v in votes.values() if len(v) > 1)
+    log(f"姿态协商：{len(poses)} 个节点、每个最多 {cfg['max_poses']} 个候选姿态，{len(history)} 轮，"
+        f"换姿态 {len(picked)} 个，仍不一致 {split} 个（按多数取）")
+    return picked
+
+
+def _violating_nodes(inp, viol):
+    """违规说明里提到的节点：直接点名的节点，以及点名的管两端的节点。"""
+    owner = {k: n["id"] for n in inp["nodes"] for o in n["orientations"] for k in o["ports"]}
+    ends = {r["id"]: (owner[r["from"]["key"]], owner[r["to"]["key"]]) for r in inp["routes"]}
+    ids = {n["id"] for n in inp["nodes"]}
+    out = set()
+    for v in viol:
+        for tok in re.findall(r"[\w\-]+", v):
+            if tok in ids:
+                out.add(tok)
+            elif tok in ends:
+                out.update(ends[tok])
     return out
 
 

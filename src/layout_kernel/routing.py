@@ -49,6 +49,10 @@ REQUIRED = ["D_default_mm", "c_rho", "eps_z_mm", "pitch_mm", "margin_mm", "max_i
 UNLIMITED_CHANGES = 1000                                       # 高度变化次数不限时的内部上限（远超实际可能）
 
 
+class OffGrid(ValueError):
+    """点不在布管网格上（例如端口高于顶棚或在场景范围外）。"""
+
+
 def check_params(rp, weights):
     miss = [k for k in REQUIRED if k not in rp] + [f"weights.{k}" for k in ("area", "length", "bends", "height_changes")
                                                    if k not in weights]
@@ -90,6 +94,7 @@ class Scene:
         self.spools = (spools or []) if c["internal_spools"]["enabled"] else []
         # “管件式”端口：端口外已有管件（如斜支口伸出段末端的 45° 弯），出入时按弯头计直管长度
         self.fitting_ports = {(did, pn) for did, d in devices.items() for pn in d.get("fitting_ports", ())}
+        self.pose_cfg = None                                    # 姿态协商参数（scene 的 pose_negotiation 设置）
         self.lmin = scale["l_min_mm"]
         self.scale = scale                                      # A0 (mm²)、L0 (mm)、B0、C0、kappa
         D0 = rp["D_default_mm"]
@@ -105,7 +110,9 @@ class Scene:
                 self.np[n["id"]] = {"D": D, "rho": n.get("rho_mm", rp["c_rho"] * D),
                                     "lmin": max(self.lmin, n.get("lead_mm", 0.0)), "zc_max": zc,
                                     "port_straight": {(dev, pn): n["port_straight_mm"][pn]
-                                                      for dev, pn in n["terms"] if pn in n.get("port_straight_mm", {})}}
+                                                      for dev, pn in n["terms"] + [t for side in n.get("alts", ())
+                                                                                   for t, _pose in side]
+                                                      if pn in n.get("port_straight_mm", {})}}
             else:                                                       # 不限直管长度：只要求正交
                 self.np[n["id"]] = {"D": D, "rho": 0.0, "lmin": 0.0, "zc_max": zc, "port_straight": {}}
             self.np[n["id"]].update(wl=float(n.get("weight_length", 1.0)), wb=float(n.get("weight_bends", 1.0)),
@@ -117,7 +124,7 @@ class Scene:
         self.r_pp = self.D + self.gap_pp
         self.boxes = []                                         # (x0,y0,z0,x1,y1,z1, r, owner)
         for did, d in devices.items():
-            if d["box"] is not None:
+            if d["box"] is not None and not d.get("ghost"):         # ghost：姿态协商中的候选姿态，只提供端口
                 self.boxes.append((*d["box"], self.r_ep, did))
             if self.zone_h is not None:
                 for zx0, zy0, zx1, zy1 in d["zones"]:
@@ -178,19 +185,20 @@ class Grid:
         self.blocked = blocked.ravel().astype(np.uint8)
         self.eblocked = [e.ravel().astype(np.uint8) for e in eblocked]
         self.stride = (ny_ * nz_, nz_, 1)
-        self.spool_codes = {}                                          # 按所属节点分组的“只对该节点的管豁免”的晕
+        self.near_codes = {}                                           # 固定管路在汇合节点口附近的晕：接该节点的管豁免
         for f in sc.fixed_routes.values():                             # 固定管路：其占用晕设为硬障碍
             fr = {"points": [tuple(q) for q in f["points"]], "trim_nodes": tuple(f.get("trim_nodes", (None, None)))}
             codes = halo_codes(self, sc, [fr], f["D_mm"], exempt=set())
             for node in {x for x in fr["trim_nodes"] if x is not None}:
                 near = np.setdiff1d(codes, halo_codes(self, sc, [fr], f["D_mm"], exempt={node}))
-                self.spool_codes[node] = np.union1d(self.spool_codes.get(node, np.zeros(0, dtype=np.int64)), near)
+                self.near_codes[node] = np.union1d(self.near_codes.get(node, np.zeros(0, dtype=np.int64)), near)
             codes = halo_codes(self, sc, [fr], f["D_mm"])              # 所有汇合处都去掉后的部分：对谁都是障碍
             for c in codes.tolist():
                 self.eblocked[c % 3][c // 3] = 1
+        self.spool_list = []                                           # (所属节点, 所属管或 None, 晕)
         for sp in sc.spools:
             codes = halo_codes(self, sc, [{"points": [tuple(q) for q in sp["points"]]}], sp["D_mm"])
-            self.spool_codes[sp["owner"]] = np.union1d(self.spool_codes.get(sp["owner"], np.zeros(0, dtype=np.int64)), codes)
+            self.spool_list.append((sp["owner"], sp.get("pipe"), codes))
 
     def _open_range(self, a, lo, hi):
         """坐标严格落在 (lo, hi) 内的下标区间 [i0, i1)。"""
@@ -217,7 +225,7 @@ class Grid:
         for a in range(3):
             i = bisect.bisect_left(self.c[a], pt[a] - 1e-6)
             if i >= self.n[a] or abs(self.c[a][i] - pt[a]) > 1e-6:
-                raise ValueError(f"点 {pt} 不在网格上（轴 {a}）")
+                raise OffGrid(f"点 {pt} 不在网格上（轴 {a}）")
             idx.append(i)
         return (idx[0] * self.n[1] + idx[1]) * self.n[2] + idx[2]
 
@@ -240,9 +248,10 @@ class Grid:
         return nb, lower, a, abs(self.c[a][m] - self.c[a][ijk[a]])
 
     def free_for(self, pt, owner_ok):
-        """几何判断点是否不在障碍内（跳过 owner_ok 设备本身）。"""
+        """几何判断点是否不在障碍内（跳过 owner_ok 设备本身；owner_ok 可为集合）。"""
+        oks = owner_ok if isinstance(owner_ok, set) else {owner_ok}
         for b in self.sc.boxes:
-            if b[7] is not None and b[7] == owner_ok:
+            if b[7] is not None and b[7] in oks:
                 continue
             r = b[6]
             if all(b[a] - r < pt[a] < b[a + 3] + r for a in range(3)):
@@ -260,6 +269,7 @@ def port_exemptions(G, sc, terms):
     for dev, pn in terms:
         x, y, z, ux, uy, uz = sc.port(dev, pn)
         own = sc.dev[dev]["box"]
+        passing = sc.dev[dev].get("pass_owner")                         # ghost 的真实节点：其当前盒可穿过（它会让开）
         if own is not None and all(own[k] - 1e-9 <= (x, y, z)[k] <= own[k + 3] + 1e-9 for k in range(3)):
             k = DIRS[DIR_OF[(ux, uy, uz)]][0]
             inside[(dev, pn)] = (own[k + 3] - (x, y, z)[k]) if (ux, uy, uz)[k] > 0 else ((x, y, z)[k] - own[k])
@@ -270,21 +280,23 @@ def port_exemptions(G, sc, terms):
         nodes.add(n)
         own = sc.dev[dev]["box"]
         r = sc.r_ep
+        mine = [b for b in (own, sc.dev[passing]["box"] if passing else None) if b is not None]
+        ok_owner = {dev, passing} if passing else dev
 
         def inside_own(pt):
-            return own is not None and all(own[k] - r - 1e-9 <= pt[k] <= own[k + 3] + r + 1e-9 for k in range(3))
+            return any(all(b[k] - r - 1e-9 <= pt[k] <= b[k + 3] + r + 1e-9 for k in range(3)) for b in mine)
         while dist < sc.r_ep - 1e-9 or inside_own(G.pt(n)):
             st = G.step(n, d)
             if st is None:
                 break
             nb, lower, a, ln = st
             mid = tuple((G.pt(n)[k] + G.pt(nb)[k]) / 2 for k in range(3))
-            if not G.free_for(mid, dev):
+            if not G.free_for(mid, ok_owner):
                 break
             edges.add((lower, a))
             dist += ln
             n = nb
-            if G.free_for(G.pt(n), dev):
+            if G.free_for(G.pt(n), ok_owner):
                 nodes.add(n)
     return nodes, edges, inside
 
@@ -309,7 +321,9 @@ def tree_heuristic(G, segs, cL):
 
 def astar(G, sc, start, target, ctx):
     """编译实现（astar_fast.search）。规则与 astar_py 相同，测试中逐例比对。
-    start = (dev, port)；target = ("port", (dev, port)) 或 ("tree", tree)。返回 (折线点列表, 结束信息) 或 None。"""
+    start = (dev, port) 或 [((dev, port), 附加代价), ...]（多起点）；
+    target = ("port", (dev, port))、("ports", [((dev, port), 附加代价), ...])（多终点）或 ("tree", tree)。
+    返回 (折线点列表, 结束信息, (起点序号, 终点序号)) 或 None。"""
     cL = sc.w["length"] / sc.scale["L0"] * ctx.get("wl", 1.0)          # 本管权重倍数
     cB = sc.w["bends"] / sc.scale["B0"] * ctx.get("wb", 1.0)
     cC = sc.w["height_changes"] / sc.scale["C0"] * ctx.get("wc", 1.0)
@@ -318,43 +332,48 @@ def astar(G, sc, start, target, ctx):
     hi_ = hist if isinstance(hist, np.ndarray) else np.zeros(G.size * 3, dtype=np.float32)
     ex_nodes = np.array(sorted(ctx["ex_nodes"]), dtype=np.int64)
     ex_edges = np.array(sorted(n * 3 + a for n, a in ctx["ex_edges"]), dtype=np.int64)
-    sx, sy, sz, sux, suy, suz = sc.port(*start)
-    s0 = G.node((sx, sy, sz))
-    d0 = DIR_OF[(sux, suy, suz)]
+    starts = start if isinstance(start, list) else [(tuple(start), 0.0)]
+    s_arr = np.array([G.node(sc.port(*st)[:3]) for st, _c in starts], dtype=np.int64)
+    d0_arr = np.array([DIR_OF[tuple(sc.port(*st)[3:])] for st, _c in starts], dtype=np.int64)
+    lp0_arr = np.array([0 if tuple(st) in sc.fitting_ports else 1 for st, _c in starts], dtype=np.int64)
+    run0_arr = np.array([_start_run(ctx, st) for st, _c in starts], dtype=np.float64)
+    scost = np.array([float(c) for _st, c in starts], dtype=np.float64)
     empty_i = np.zeros(0, dtype=np.int64)
     empty_f = np.zeros(0, dtype=np.float64)
-    if target[0] == "port":
-        tx, ty, tz, tux, tuy, tuz = sc.port(*target[1])
-        mode, t, t_dir = 0, G.node((tx, ty, tz)), DIR_OF[(-tux, -tuy, -tuz)]
-        tpt = np.array([tx, ty, tz], dtype=np.float64)
+    if target[0] in ("port", "ports"):
+        tl = [(tuple(target[1]), 0.0)] if target[0] == "port" else [(tuple(tt), float(c)) for tt, c in target[1]]
+        mode = 0
+        t = np.array([G.node(sc.port(*tt)[:3]) for tt, _c in tl], dtype=np.int64)
+        t_dir = np.array([DIR_OF[tuple(-v for v in sc.port(*tt)[3:])] for tt, _c in tl], dtype=np.int64)
+        tpt = np.array([sc.port(*tt)[:3] for tt, _c in tl], dtype=np.float64).reshape(len(tl), 3)
+        t_extra = np.array([_target_extra(sc, ("port", tt), ctx) for tt, _c in tl], dtype=np.float64)
+        tcost = np.array([c for _tt, c in tl], dtype=np.float64)
         hl = empty_f
         tnode, ttype, tsa, tdA, tdB, tkA, tkB, tcor = (empty_i, empty_i, empty_i, empty_f, empty_f,
                                                        empty_i, empty_i, empty_i)
-        goal_info = ("port", target[1])
     else:
         tree = target[1]
-        mode, t, t_dir = 1, 0, 0
-        tpt = np.zeros(3)
+        tl = None
+        mode, t, t_dir = 1, empty_i, empty_i
+        tpt, t_extra, tcost = np.zeros((0, 3)), empty_f, empty_f
         hl = np.asarray(ctx.get("tree_h_arr") if ctx.get("tree_h_arr") is not None
                         else tree_heuristic_arr(G, tree["segs"], cL))
         tnode, ttype, tsa, tdA, tdB, tkA, tkB, tcor = tree_arrays(tree["nodes"])
-        goal_info = ("tee", None)
     out = af.search(G.carr[0], G.carr[1], G.carr[2], G.n[0], G.n[1], G.n[2], G.blocked,
                     G.eblocked[0], G.eblocked[1], G.eblocked[2], ha, hi_, float(ctx["pres"]),
                     ex_nodes, ex_edges, float(ctx["rho"]), float(ctx["lmin"]), int(sc.K), float(ctx["zc_max"]),
                     cL, cB, cC, float(sc.rp["astar_weight"]), int(sc.rp["max_expansions"]),
-                    int(s0), int(d0), mode, int(t), int(t_dir), tpt, hl,
-                    tnode, ttype, tsa, tdA, tdB, tkA, tkB, tcor,
-                    0 if tuple(start) in sc.fitting_ports else 1,
-                    _target_extra(sc, target, ctx),
-                    float(ctx.get("self_clear", 0.0)), _start_run(ctx, start), float(sc.self_skip))
-    nodes, dirs, par, gid, exp, exhausted = out
+                    s_arr, d0_arr, lp0_arr, run0_arr, scost, mode, t, t_dir, tpt, t_extra, tcost,
+                    hl, tnode, ttype, tsa, tdA, tdB, tkA, tkB, tcor,
+                    float(ctx.get("self_clear", 0.0)), float(sc.self_skip))
+    nodes, dirs, par, gid, exp, exhausted, sidx, gj = out
     ctx["stats"]["expansions"] += int(exp)
     if gid < 0:
         if exhausted:
             ctx["stats"]["exhausted"] += 1
         return None
-    return _trace_arrays(G, nodes, dirs, par, int(gid)), goal_info
+    goal_info = ("port", tl[int(gj)][0]) if tl is not None else ("tee", None)
+    return _trace_arrays(G, nodes, dirs, par, int(gid)), goal_info, (int(sidx[int(gid)]), int(gj))
 
 
 def _port_delta(ctx, term):
@@ -810,13 +829,47 @@ def port_access_blocked(G, sc, terms, ex_nodes, ex_edges, lmin):
     return bad
 
 
+def _port_rays(G, sc, terms):
+    """各端口沿法向直到网格边界的全部边（边编码）：首段 / 末段只会走在这条线上。"""
+    out = []
+    for t in terms:
+        x, y, z, ux, uy, uz = sc.port(*t)
+        n, d = G.node((x, y, z)), DIR_OF[(ux, uy, uz)]
+        while True:
+            st = G.step(n, d)
+            if st is None:
+                break
+            nb, lower, a, _ln = st
+            out.append(lower * 3 + a)
+            n = nb
+    return np.array(out, dtype=np.int64)
+
+
+def spool_blocks(G, sc, net):
+    """本管网搜索时临时设为障碍的边：
+      - 其他节点的内部短管（含斜段）、其他节点口附近的固定管路：全部；
+      - 本管所接节点的内部短管：除端口法向射线上的边（首段、末段只在那里）以外全部——与校验器一致：
+        接在节点上的管只有首段与末段豁免；
+      - 本管自己的斜段、本管所接节点口附近的固定管路：不挡。"""
+    terms = [tuple(t) for t in net["terms"]] + [tuple(t) for side in net.get("alts", ()) for t, _pose in side]
+    own = {dev for dev, _pn in terms} | {pose[0] for side in net.get("alts", ()) for _t, pose in side}
+    parts, rays = [], None
+    for owner, pipe, codes in G.spool_list:
+        if pipe == net["id"]:
+            continue
+        if owner in own:
+            rays = _port_rays(G, sc, terms) if rays is None else rays
+            codes = np.setdiff1d(codes, rays)
+        parts.append(codes)
+    parts += [c for owner, c in G.near_codes.items() if owner not in own]
+    return np.unique(np.concatenate(parts)) if parts else np.zeros(0, dtype=np.int64)
+
+
 def route_net(G, sc, net, ctx):
-    """返回 (支路列表, None) 或 (None, 失败原因)。其他节点的内部短管作为临时硬障碍（本管所接节点的除外）。"""
-    own = {dev for dev, _pn in net["terms"]}
-    codes = [c for owner, c in G.spool_codes.items() if owner not in own]
-    if not codes:
+    """返回 (支路列表, None) 或 (None, 失败原因)。内部短管等临时障碍见 spool_blocks。"""
+    codes = spool_blocks(G, sc, net)
+    if not codes.size:
         return _route_net(G, sc, net, ctx)
-    codes = np.unique(np.concatenate(codes))
     saved = []
     for a in range(3):
         idx = codes[codes % 3 == a] // 3
@@ -829,7 +882,30 @@ def route_net(G, sc, net, ctx):
             G.eblocked[a][idx] = old
 
 
+def _route_alts(G, sc, net, ctx):
+    """两端点管网、两端各有候选端口（节点的候选姿态）：一次多起点 / 多终点搜索，同时选定两端的姿态。
+    ctx["alt_cost"] = {端口: 选它的附加代价}（姿态协商的分歧价）。端口正前方被堵的候选直接去掉。"""
+    npar = sc.net_param(net["id"])
+    A, B = ([tuple(t) for t, _pose in side] for side in net["alts"])
+    ex_nodes, ex_edges, inside = port_exemptions(G, sc, A + B)
+    blocked = set(port_access_blocked(G, sc, A + B, ex_nodes, ex_edges, npar["lmin"]))
+    A, B = [t for t in A if t not in blocked], [t for t in B if t not in blocked]
+    if not A or not B:
+        return None, "端口正前方不足 ℓ_min：所有候选姿态都被堵"
+    ctx = {**ctx, "ex_nodes": ex_nodes, "ex_edges": ex_edges, "rho": npar["rho"], "lmin": npar["lmin"],
+           "zc_max": npar["zc_max"], "inside": inside,
+           "self_clear": (npar["D"] + sc.gap_pp) if sc.self_on and not ctx.get("relax_self") else 0.0,
+           "port_straight": npar["port_straight"], "wl": npar["wl"], "wb": npar["wb"], "wc": npar["wc"]}
+    ac = ctx.get("alt_cost") or {}
+    r = astar(G, sc, [(t, ac.get(t, 0.0)) for t in A], ("ports", [(t, ac.get(t, 0.0)) for t in B]), ctx)
+    if r is None:
+        return None, "搜索未找到路径（或超过扩展上限）"
+    return [{"start": A[r[2][0]], "points": r[0], "end": ("port", B[r[2][1]])}], None
+
+
 def _route_net(G, sc, net, ctx):
+    if net.get("alts"):
+        return _route_alts(G, sc, net, ctx)
     terms = net["terms"]
     npar = sc.net_param(net["id"])
     ex_nodes, ex_edges, inside = port_exemptions(G, sc, terms)
@@ -892,23 +968,76 @@ def _worker_route(args):
     return _route_one(_W["G"], _W["sc"], _W["halo"], _W["hist"], *args)
 
 
+def _pose_setup(sc):
+    """姿态协商的索引：{管网序号: {端口: (节点, 姿态)}}，{节点: [管网序号]}。"""
+    alt = {e: {tuple(t): tuple(pose) for side in n["alts"] for t, pose in side}
+           for e, n in enumerate(sc.nets) if n.get("alts")}
+    at = {}
+    for e, m in alt.items():
+        for node in {pose[0] for pose in m.values()}:
+            at.setdefault(node, []).append(e)
+    return alt, at
+
+
+def _chosen(routes, alt, e):
+    """管网 e 当前选定的姿态 {节点: 姿态}（按它的起终点端口）。"""
+    br = routes.get(e)
+    if br is None or e not in alt:
+        return {}
+    out = {}
+    for t in (tuple(br[0]["start"]), tuple(br[0]["end"][1])):
+        node, k = alt[e][t]
+        out[node] = k
+    return out
+
+
+def _alt_cost(sc, routes, alt, at, pose_hist, e, level):
+    """管网 e 各候选端口的附加代价：同节点其他管选了别的姿态的根数 × 当前压力 + 该姿态累积的历史价（弯头当量）。"""
+    if e not in alt:
+        return None
+    cb = sc.w["bends"] / sc.scale["B0"]
+    cfg = sc.pose_cfg
+    out = {}
+    for t, (node, k) in alt[e].items():
+        other = sum(1 for f in at[node] if f != e and _chosen(routes, alt, f).get(node, k) != k)
+        out[t] = cb * (cfg["pres_bends"] * level * other + pose_hist.get((node, k), 0.0))
+    return out
+
+
+def pose_disagreements(routes, alt, at):
+    """{节点: {姿态: 选它的管网序号列表}}，只列出选择不一致的节点。"""
+    out = {}
+    for node, es in at.items():
+        votes = {}
+        for f in es:
+            k = _chosen(routes, alt, f).get(node)
+            if k is not None:
+                votes.setdefault(k, []).append(f)
+        if len(votes) > 1:
+            out[node] = votes
+    return out
+
+
 class _Zero:
     def __getitem__(self, _):
         return 0
 
 
-def _route_one(G, sc, halo, hist, e, pres, never_routed):
+def _route_one(G, sc, halo, hist, e, pres, never_routed, alt_cost=None):
     """带拥堵代价搜索（A* 中实时读取共享占用表）；失败且该管网从未布通过时，再做一次无拥堵搜索。
-    info["free_fail"] = 无拥堵搜索也失败（或端口被堵）：该布局下布不通，之后不再重试。"""
+    info["free_fail"] = 无拥堵搜索也失败（或端口被堵）：该布局下布不通，之后不再重试。
+    alt_cost：姿态协商中各候选端口的附加代价（见 _alt_cost）。"""
     t0 = time.time()
     stats = {"expansions": 0, "exhausted": 0}
-    br, reason = route_net(G, sc, sc.nets[e], {"halo": halo, "hist": hist, "pres": pres, "stats": stats})
+    br, reason = route_net(G, sc, sc.nets[e], {"halo": halo, "hist": hist, "pres": pres, "stats": stats,
+                                               "alt_cost": alt_cost})
     fallback = free_fail = False
     if br is None and reason.startswith("端口正前方"):
         free_fail = True
     elif br is None and never_routed:
         fallback = True
-        br, reason = route_net(G, sc, sc.nets[e], {"halo": _Zero(), "hist": _Zero(), "pres": 0.0, "stats": stats})
+        br, reason = route_net(G, sc, sc.nets[e], {"halo": _Zero(), "hist": _Zero(), "pres": 0.0, "stats": stats,
+                                                   "alt_cost": alt_cost})
         free_fail = br is None
     info = {"net": sc.nets[e]["id"], "time_s": round(time.time() - t0, 2), "fallback": fallback,
             "free_fail": free_fail, **stats}
@@ -918,7 +1047,7 @@ def _route_one(G, sc, halo, hist, e, pres, never_routed):
             [n * 3 + ax for n, ax in path_edges(G, br)], info)
 
 
-def negotiate(sc, log=print):
+def negotiate(sc, log=print, cleanup_enabled=True):
     """有交流的并行协商布线（PathFinder 变体 + 乐观并发）。
     共享状态：每条边的占用计数（各管网“晕”的叠加）与历史拥堵代价，放在共享内存里；
       只有主进程写，工作进程在 A* 中实时读——一根管一提交，之后的搜索立即看到。
@@ -928,6 +1057,10 @@ def negotiate(sc, log=print):
     每轮：第 1 轮布全部管网，之后只重布有冲突或未布通的管网；轮末冲突边累积历史代价。
     带拥堵代价搜索失败时保留上一轮路径；无拥堵也布不通的管网记为该布局下不可布，不再重试。
     route_workers = 1 时串行（无并发冲突，逻辑相同）。
+    姿态协商（管网带 alts 时，见 scene 的 pose_negotiation）：每根管在两端节点的候选姿态里一起选；同一节点上
+    各管选的姿态不一致时，像拥堵一样处理——选了少数派姿态要付“分歧根数 × 压力”的附加代价，轮末给不一致节点的
+    各姿态累积历史价（少数派加得多），并把这些管网列入下一轮重布，直到一致。cleanup_enabled=False 时不做清理
+    （只要协商结果，例如用来选姿态）。
 """
     G = Grid(sc)
     rp = sc.rp
@@ -960,6 +1093,9 @@ def negotiate(sc, log=print):
     best_key, since_best = None, 0
     stuck = {}                                                          # 连续“搜到扩展上限、保留旧路径”的次数
     tried, done_clean = set(), None                                     # 协商中途试清理：已试过的冲突管网集合
+    alt, at = _pose_setup(sc)
+    pose_hist = {}
+    level = 1.0                                                         # 姿态分歧压力，随轮次增长
 
     def rip(e):
         old = (routes.pop(e, None), halos.pop(e, None), pedges.pop(e, None))
@@ -997,14 +1133,16 @@ def negotiate(sc, log=print):
             if ex is None:
                 for e in queue:
                     old = rip(e)
-                    finish(_route_one(G, sc, halo, hist, e, pres, e not in ever), old, times, counters)
+                    finish(_route_one(G, sc, halo, hist, e, pres, e not in ever,
+                                      _alt_cost(sc, routes, alt, at, pose_hist, e, level)), old, times, counters)
             else:
                 inflight, requeues = {}, {}
                 while queue or inflight:
                     while queue and len(inflight) < workers:
                         e = queue.pop(0)
                         old = rip(e) if e not in requeues else requeues[e][1]
-                        fut = ex.submit(_worker_route, (e, pres, e not in ever))
+                        fut = ex.submit(_worker_route, (e, pres, e not in ever,
+                                                        _alt_cost(sc, routes, alt, at, pose_hist, e, level)))
                         inflight[fut] = (e, old, len(commits))
                     counters["max_parallel"] = max(counters["max_parallel"], len(inflight))
                     done, _ = wait(inflight, return_when=FIRST_COMPLETED)
@@ -1029,21 +1167,31 @@ def negotiate(sc, log=print):
                         conflicted.add(e)
                         hist[ei] += rp["hist_fac"]
             retry = {e for e in why if e not in hard}
+            split = pose_disagreements(routes, alt, at)
+            for node, votes in split.items():                           # 姿态不一致：累积历史价，相关管网下一轮重布
+                deg = sum(len(v) for v in votes.values())
+                for k in {pose[1] for m in alt.values() for pose in m.values() if pose[0] == node}:
+                    pose_hist[(node, k)] = pose_hist.get((node, k), 0.0) + \
+                        sc.pose_cfg["hist_bends"] * (deg - len(votes.get(k, ()))) / deg
+                for es in votes.values():
+                    conflicted.update(es)
             slow = sorted(times, key=lambda x: -x["time_s"])
             cpu = sum(x["time_s"] for x in times)
             el = time.time() - t_it
             history.append({"iter": it + 1, "rerouted": len(queue if ex is None else todo), "kept_old": counters["kept"],
                             "requeued": counters["requeued"], "max_parallel": counters["max_parallel"],
                             "conflict_edges": conflicts, "conflicted_nets": len(conflicted), "time_s": round(el, 1),
+                            "pose_split_nodes": len(split),
                             "search_time_sum_s": round(cpu, 1), "net_times": slow,
                             "failed": {sc.nets[e]["id"]: r for e, r in why.items()}})
             log(f"  第 {it + 1} 轮：墙钟 {el:.1f} s / 搜索合计 {cpu:.1f} s（同时最多 {counters['max_parallel']}，"
                 f"并发冲突重搜 {counters['requeued']}），冲突边 {conflicts}（{len(conflicted)} 个管网），保留旧路径 "
-                f"{counters['kept']}，未布通 {len(why)}（其中不可布 {len(hard)}）；最慢："
+                f"{counters['kept']}，未布通 {len(why)}（其中不可布 {len(hard)}），姿态不一致节点 {len(split)}；最慢："
                 + "、".join(f"{x['net']} {x['time_s']}s{'(回退)' if x['fallback'] else ''}" for x in slow[:3]))
             if not conflicted and not retry:
                 break
-            if not retry and len(conflicted) <= rp["cleanup_trigger_nets"] and frozenset(conflicted) not in tried:
+            if cleanup_enabled and not split and not retry and len(conflicted) <= rp["cleanup_trigger_nets"] \
+                    and frozenset(conflicted) not in tried:
                 tried.add(frozenset(conflicted))
                 t_c = time.time()
                 cand, rec = cleanup(G, sc, {sc.nets[e]["id"]: br for e, br in routes.items()}, log)
@@ -1053,7 +1201,7 @@ def negotiate(sc, log=print):
                 if ok_c:
                     done_clean = (cand, rec, round(time.time() - t_c, 1))
                     break
-            key = (len(retry), conflicts)
+            key = (len(retry), len(split), conflicts)
             if best_key is None or key < best_key:
                 best_key, since_best = key, 0
             else:
@@ -1063,12 +1211,16 @@ def negotiate(sc, log=print):
                     break
             todo = sorted(conflicted | retry, key=lambda e: -len(sc.nets[e]["terms"]))
             pres *= rp["pres_fac_mult"]
+            level *= rp["pres_fac_mult"]
     finally:
         if ex is not None:
             ex.shutdown(wait=True, cancel_futures=True)
             del halo, hist
             for sh in shms:
                 sh.close(); sh.unlink()
+    if not cleanup_enabled:
+        history[-1]["cleanup"] = None
+        return {sc.nets[e]["id"]: br for e, br in routes.items()}, history, G
     if done_clean is not None:
         out, records, tc = done_clean
     else:
@@ -1328,6 +1480,8 @@ def check_routes(sc, routes):
         ends = {d for d, _p in net_of[nid]["terms"]}
         D = sc.net_param(nid)["D"]
         for sp in sc.spools:
+            if sp.get("pipe") == nid:                                  # 本管自己的斜段
+                continue
             sboxes = [_box(tuple(p), tuple(q), sp["D_mm"] / 2) for p, q in zip(sp["points"], sp["points"][1:])]
             for br in brs:
                 sg = segments_of(br["points"])

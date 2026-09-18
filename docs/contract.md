@@ -190,6 +190,7 @@ layout-kernel-scene < 请求.json > 结果.json        # 或 python -m layout_ke
 - 设置：`routing`（求解参数 + `constraints`）、`weights`、`scale`、`oblique_stub_mm`、`pipe_rules`、
   `rotation_candidates`（每个可转节点每轮真实重布几种朝向）、`lower_bound`（`{enabled, max_expansions}`）、
   `candidate_routing`（评估候选时覆盖 `routing` 的轻量参数，如 `{max_iters, stall_iters, max_expansions, cleanup_max_expansions}`；最终联合重布仍用 `routing`）。
+  `pose_negotiation`（`{enabled, max_poses, pres_bends, hist_bends}`，姿态协商，见下）。
 
 **结果** `{ok, violations, metrics, routes, offsets, orientations, moves, cost, base_cost, lower_bound, timing}`
 
@@ -197,7 +198,9 @@ layout-kernel-scene < 请求.json > 结果.json        # 或 python -m layout_ke
 - `lower_bound`：`{valid, value, cost, gap, nets, unresolved, note}`。设备位置与朝向固定为最终方案时，各两端点管单独求精确最短路（不考虑其他待布管、放宽同管自身净距）之和；`gap = (cost − value) / cost` 是当前方案离这一下界的最大相对差距。它**不是**设备也能移动时的全局下界；多端点管网不给下界。
 - `pipe_rules` 用来把调用方自己的直管 / 弯头规则换算成内核的直管长度要求（见 `scene._straight_rules`），只在 `straight_lengths` 打开时生效。端口在自身设备盒内时，盒内长度并入端口直颈再套用该规则（对方的弯头让位按整段直管的比例计，弯头圆弧须整段在盒外并与设备留 `pipe_equipment_clearance` 净距）。
 
-**优化过程**：先按当前姿态重布；每一轮生成全部候选（串联拉直、单个对齐、换朝向），用 `routing.route_workers` 个进程并行评估（每个候选只重布相连的管、其余固定，用 `candidate_routing` 参数）；有改进的候选按改进量排序，挑出互不相干（移动对象与相关管都不重叠）的一批，合起来复核仍有改进就一次接受（否则只接受最好的一个）；没有改进后，按最终姿态用完整参数联合重布一次取更好者。`seconds` 限制候选评估：到时停止收集候选结果，只在已评估的里挑；到时后跳过最终联合重布。开头的整网重布（比较基准）与下界计算不在限时内。换朝向的候选先按“端口间曼哈顿距离 + 弯头下界”估计排序，只真实重布前 `rotation_candidates` 个。
+**姿态协商**（`pose_negotiation.enabled`）：在逐个候选之前做一次。每个可动节点取当前姿态 + 至多 `max_poses` 个候选姿态（换朝向、平移候选，按估计排序；单独就违反设备间距 / 禁区的去掉），每个候选姿态做成只有端口与内部短管、包围盒不当障碍的虚拟节点。协商布线时每根管在两端节点的候选端口间做一次多起点 / 多终点 A*，同时选定两端姿态；同一节点上各管选择不一致时按拥堵的办法处理：选少数派姿态要付“分歧根数 × `pres_bends` 个弯头当量 × 压力”（压力每轮乘 `pres_fac_mult`），轮末给不一致节点的各姿态累积 `hist_bends` 的历史价（少数派加得多），并重布这些管，直到一致（仍不一致按多数取）。选定的姿态再按正式规则（设备盒、完整参数）重布并校验，更好才采用；个别节点按正式规则布不通时退回原姿态重试（至多两次）。这是启发式：只用来选姿态，不改变校验口径。
+
+**优化过程**：先按当前姿态重布；（姿态协商；）每一轮生成全部候选（串联拉直、单个对齐、换朝向），用 `routing.route_workers` 个进程并行评估（每个候选只重布相连的管、其余固定，用 `candidate_routing` 参数）；有改进的候选按改进量排序，挑出互不相干（移动对象与相关管都不重叠）的一批，合起来复核仍有改进就一次接受（否则只接受最好的一个）；没有改进后，按最终姿态用完整参数联合重布一次取更好者。`seconds` 限制候选评估：到时停止收集候选结果，只在已评估的里挑；到时后跳过最终联合重布。开头的整网重布（比较基准）与下界计算不在限时内。换朝向的候选先按“端口间曼哈顿距离 + 弯头下界”估计排序，只真实重布前 `rotation_candidates` 个。
 
 ## 8. 还没有的能力
 

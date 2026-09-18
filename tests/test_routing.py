@@ -1,5 +1,6 @@
 """布管原型测试（手工小场景）。运行：.venv/Scripts/python -m pytest -q（在本目录）"""
 import copy
+import math
 import random
 
 import numpy as np
@@ -376,6 +377,51 @@ def test_fixed_route_near_junction_blocks_other_pipes():
     fixed = {"f": {"points": [(2000, 500, 500), (2000, 500, 2500)], "D_mm": 200, "trim_nodes": ("J", None)}}
     sc = rt.Scene(dev, nets, {**RP, "constraints": cons(K=3)}, W, SCALE, fixed)
     G = rt.Grid(sc)
-    near = G.spool_codes.get("J")
+    near = G.near_codes.get("J")
     assert near is not None and near.size > 0                       # 口附近那段晕按节点 J 分组，不是全局放开
     assert all(G.eblocked[c % 3][c // 3] == 0 for c in near.tolist())
+
+
+@pytest.mark.parametrize("costs", [{}, {("A", "p1"): 5.0}, {("B", "q2"): 5.0, ("A", "p2"): 0.2}])
+def test_multi_start_multi_target_equals_best_pair(costs):
+    """多起点 / 多终点 A*（节点候选姿态）：结果代价 = 各（起点, 终点）组合单独搜索的代价 + 附加代价 的最小值。"""
+    dev = {"A": box(0, 0, 1000, 1500, ports={"p1": (1000, 300, 500, 1, 0, 0), "p2": (500, 1500, 500, 0, 1, 0)}),
+           "B": box(4000, 900, 1000, 1500, ports={"q1": (4000, 1100, 500, -1, 0, 0), "q2": (4500, 900, 500, 0, -1, 0)})}
+    alts = [[(("A", "p1"), ("A", 0)), (("A", "p2"), ("A", 1))], [(("B", "q1"), ("B", 0)), (("B", "q2"), ("B", 1))]]
+    base = {"id": "n", "terms": [("A", "p1"), ("B", "q1")]}
+    sc = scene(dev, [{**base, "alts": alts}], K=3)
+    G = rt.Grid(sc)
+    zero = {"halo": rt._Zero(), "hist": rt._Zero(), "pres": 0.0}
+
+    def cost(br):
+        return rt.net_cost(sc, "n", rt.check_routes(sc, {"n": br})[1]["per_net"]["n"])
+    br, why = rt.route_net(G, sc, sc.nets[0], {**zero, "stats": {"expansions": 0, "exhausted": 0}, "alt_cost": costs})
+    assert br is not None, why
+    got = cost(br) + costs.get(tuple(br[0]["start"]), 0.0) + costs.get(tuple(br[0]["end"][1]), 0.0)
+    best = math.inf
+    for a, _ in alts[0]:
+        for b, _ in alts[1]:
+            single = {"id": "n", "terms": [a, b]}
+            r, _w = rt.route_net(G, sc, single, {**zero, "stats": {"expansions": 0, "exhausted": 0}})
+            if r is not None:
+                best = min(best, cost(r) + costs.get(a, 0.0) + costs.get(b, 0.0))
+    assert abs(got - best) < 1e-6
+
+
+def test_pose_negotiation_reaches_consensus():
+    """姿态协商：节点 J 有两个候选姿态，n1 单独更喜欢姿态 0、n2 单独更喜欢姿态 1；协商后两根管必须选同一个姿态。"""
+    dev = {"A": box(0, 0, 1000, 1000, ports={"p": (1000, 500, 500, 1, 0, 0)}),
+           "B": box(5000, 2000, 1000, 1000, ports={"q": (5000, 2500, 500, -1, 0, 0)}),
+           "J": {"box": None, "zones": [], "ports": {"j": (2500, 500, 500, -1, 0, 0), "k": (2800, 500, 500, 1, 0, 0)}},
+           "J#1": {"box": None, "zones": [], "ghost": True, "pass_owner": "J",
+                   "ports": {"j#1": (2500, 2500, 500, -1, 0, 0), "k#1": (2800, 2500, 500, 1, 0, 0)}}}
+    nets = [{"id": "n1", "terms": [("A", "p"), ("J", "j")],
+             "alts": [[(("A", "p"), ("A", 0))], [(("J", "j"), ("J", 0)), (("J#1", "j#1"), ("J", 1))]]},
+            {"id": "n2", "terms": [("J", "k"), ("B", "q")],
+             "alts": [[(("J", "k"), ("J", 0)), (("J#1", "k#1"), ("J", 1))], [(("B", "q"), ("B", 0))]]}]
+    sc = scene(dev, nets, K=3)
+    sc.pose_cfg = {"pres_bends": 1.0, "hist_bends": 0.5}
+    routes, hist, _G = rt.negotiate(sc, log=lambda *_: None, cleanup_enabled=False)
+    ends = {routes["n1"][0]["end"][1][0], routes["n2"][0]["start"][0]}
+    assert len(ends) == 1                                            # 两根管接在同一个姿态上
+    assert hist[0]["pose_split_nodes"] == 1 and hist[-1]["pose_split_nodes"] == 0   # 第 1 轮分歧，协商后一致

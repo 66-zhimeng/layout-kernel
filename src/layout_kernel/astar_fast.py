@@ -5,8 +5,12 @@
   网格    cx, cy, cz（各轴坐标）、n0, n1, n2、blocked（节点）、eb0/eb1/eb2（边，按下端节点）
   拥堵    halo（int32）、hist（float32）、pres
   豁免    ex_nodes（排序后的节点号）、ex_edges（排序后的边号 = 下端节点×3 + 轴）
-  目标    mode=0 端口：t、t_dir、tpt、ta、ts；mode=1 接树：hl（每个节点的启发式）与树上可接点的数组
+  起点    可有多个（节点候选姿态的端口）：s、d0、lp0、run0、起点附加代价 scost，均为数组
+  目标    mode=0 端口，可有多个：t、t_dir、tpt（T×3）、t_extra、目标附加代价 tcost；
+          mode=1 接树：hl（每个节点的启发式）与树上可接点的数组
 状态    (节点, 方向, 上个管件是端口, 高度变化次数, 已有水平段, 自上个管件起直管长度, g)
+多起点 / 多终点时 g 从起点附加代价开始、到达目标时加上目标附加代价；端口目标的启发式取各目标（附加代价 + 下界）的最小值，
+仍可采纳。
 """
 import numpy as np
 from numba import njit
@@ -109,16 +113,48 @@ def _self_close(st_node, st_dir, st_par, sid, cx, cy, cz, n1, n2, clear, skip):
 
 
 @njit(cache=True)
+def _h_port(px, py, pz, a, sg, t_dir, tpt, tcost, cL, cB):
+    """到各端口目标的下界（管长曼哈顿距离 + 至少还需的弯头数 + 目标附加代价）取最小。"""
+    best = 1e300
+    for j in range(t_dir.size):
+        ta = DIR_AXIS[t_dir[j]]
+        ts = DIR_SIGN[t_dir[j]]
+        hv = tcost[j] + cL * (abs(px - tpt[j, 0]) + abs(py - tpt[j, 1]) + abs(pz - tpt[j, 2]))
+        if a == ta:
+            if sg != ts:
+                hv += cB * 2
+            else:
+                pa = px if a == 0 else (py if a == 1 else pz)
+                al = True
+                if a != 0 and abs(px - tpt[j, 0]) > 1e-9:
+                    al = False
+                if a != 1 and abs(py - tpt[j, 1]) > 1e-9:
+                    al = False
+                if a != 2 and abs(pz - tpt[j, 2]) > 1e-9:
+                    al = False
+                if not (al and (tpt[j, a] - pa) * ts >= 0):
+                    hv += cB * 2
+        else:
+            hv += cB
+        if hv < best:
+            best = hv
+    return best
+
+
+@njit(cache=True)
 def search(cx, cy, cz, n0, n1, n2, blocked, eb0, eb1, eb2, halo, hist, pres,
            ex_nodes, ex_edges, rho, lmin, K, zc_max, cL, cB, cC, hw, max_exp,
-           s, d0, mode, t, t_dir, tpt, hl, tnode, ttype, tseg_axis, tdA, tdB, tkA, tkB, tcorner,
-           lp0, t_extra, self_clear, run0, self_skip):
-    """返回 (状态节点, 状态方向, 父状态, 目标状态号, 扩展数, 是否到上限)；目标状态号 < 0 表示没找到。"""
-    cap = max(2.0 * rho + lmin, rho + t_extra + lmin)            # 直管计数封顶：须能满足目标端的要求
+           s_arr, d0_arr, lp0_arr, run0_arr, scost, mode, t, t_dir, tpt, t_extra, tcost,
+           hl, tnode, ttype, tseg_axis, tdA, tdB, tkA, tkB, tcorner, self_clear, self_skip):
+    """返回 (状态节点, 状态方向, 父状态, 目标状态号, 扩展数, 是否到上限, 各状态的起点序号, 到达的目标序号)；
+    目标状态号 < 0 表示没找到（此时目标序号为 -1）。"""
+    tmax = 0.0
+    for j in range(t_extra.size):
+        if t_extra[j] > tmax:
+            tmax = t_extra[j]
+    cap = max(2.0 * rho + lmin, rho + tmax + lmin)               # 直管计数封顶：须能满足目标端的要求
     stride = np.array([n1 * n2, n2, 1], dtype=np.int64)
     nn = np.array([n0, n1, n2], dtype=np.int64)
-    ta = DIR_AXIS[t_dir]
-    ts = DIR_SIGN[t_dir]
 
     cap_st = 1 << 16
     st_node = np.empty(cap_st, dtype=np.int64)
@@ -130,6 +166,7 @@ def search(cx, cy, cz, n0, n1, n2, blocked, eb0, eb1, eb2, halo, hist, pres,
     st_g = np.empty(cap_st, dtype=np.float64)
     st_par = np.empty(cap_st, dtype=np.int64)
     st_goal = np.empty(cap_st, dtype=np.int64)
+    st_si = np.empty(cap_st, dtype=np.int64)
     ns = 0
 
     cap_h = 1 << 16
@@ -149,32 +186,25 @@ def search(cx, cy, cz, n0, n1, n2, blocked, eb0, eb1, eb2, halo, hist, pres,
     exhausted = False
     goal_sid = -1
 
-    # ---- 初始状态
-    hh0 = 1 if DIR_AXIS[d0] != 2 else 0
-    key = (((s * 6 + d0) * 2 + lp0) * (K + 1) + 0) * 2 + hh0
-    head[key] = nl
-    ln_run[nl] = run0; ln_g[nl] = 0.0; ln_next[nl] = -1; ln_dead[nl] = 0; nl += 1
-    st_node[ns] = s; st_dir[ns] = d0; st_lp[ns] = lp0; st_vr[ns] = 0; st_hh[ns] = hh0
-    st_run[ns] = run0; st_g[ns] = 0.0; st_par[ns] = -1; st_goal[ns] = 0; ns += 1
-    if mode == 0:
-        p0 = np.array([cx[s // stride[0]], cy[(s // n2) % n1], cz[s % n2]])
-        hv = cL * (abs(p0[0] - tpt[0]) + abs(p0[1] - tpt[1]) + abs(p0[2] - tpt[2]))
-        a0 = DIR_AXIS[d0]
-        if a0 == ta:
-            if DIR_SIGN[d0] != ts:
-                hv += cB * 2
-            else:
-                al = True
-                for b in range(3):
-                    if b != a0 and abs(p0[b] - tpt[b]) > 1e-9:
-                        al = False
-                if not (al and (tpt[a0] - p0[a0]) * ts >= 0):
-                    hv += cB * 2
+    # ---- 初始状态（每个起点一个）
+    for si in range(s_arr.size):
+        s = s_arr[si]; d0 = d0_arr[si]; lp0 = lp0_arr[si]; run0 = run0_arr[si]
+        hh0 = 1 if DIR_AXIS[d0] != 2 else 0
+        key = (((s * 6 + d0) * 2 + lp0) * (K + 1) + 0) * 2 + hh0
+        ln_run[nl] = run0; ln_g[nl] = scost[si]; ln_dead[nl] = 0
+        ln_next[nl] = head[key] if key in head else -1
+        head[key] = nl
+        nl += 1
+        st_node[ns] = s; st_dir[ns] = d0; st_lp[ns] = lp0; st_vr[ns] = 0; st_hh[ns] = hh0
+        st_run[ns] = run0; st_g[ns] = scost[si]; st_par[ns] = -1; st_goal[ns] = 0; st_si[ns] = si
+        if mode == 0:
+            hv = _h_port(cx[s // stride[0]], cy[(s // n2) % n1], cz[s % n2], DIR_AXIS[d0], DIR_SIGN[d0],
+                         t_dir, tpt, tcost, cL, cB)
         else:
-            hv += cB
-    else:
-        hv = hl[s]
-    hf[0] = hw * hv; hs[0] = 0; nh = 1
+            hv = hl[s]
+        hf[nh] = scost[si] + hw * hv; hs[nh] = ns; nh += 1
+        _sift_up(hf, hs, nh - 1)
+        ns += 1
 
     while nh > 0:
         sid = hs[0]
@@ -240,11 +270,19 @@ def search(cx, cy, cz, n0, n1, n2, blocked, eb0, eb1, eb2, halo, hist, pres,
             ng += cL * ln * (1.0 + hist[ei]) * (1.0 + pres * halo[ei])
             goal = 0
             if mode == 0:
-                if nb == t:
-                    if nd == t_dir and nrun >= (0.0 if nlp == 1 else rho) + t_extra + lmin - 1e-9:
-                        goal = 1
-                    else:
-                        continue
+                hit = False
+                gbest = 1e300
+                for j in range(t.size):
+                    if nb == t[j]:
+                        hit = True
+                        if nd == t_dir[j] and nrun >= (0.0 if nlp == 1 else rho) + t_extra[j] + lmin - 1e-9 \
+                                and tcost[j] < gbest:
+                            gbest = tcost[j]
+                            goal = j + 1
+                if hit:
+                    if goal == 0:
+                        continue                                   # 不能穿过目标端口
+                    ng += gbest
             else:
                 ti = np.searchsorted(tnode, nb)
                 if ti < tnode.size and tnode[ti] == nb:
@@ -303,31 +341,14 @@ def search(cx, cy, cz, n0, n1, n2, blocked, eb0, eb1, eb2, halo, hist, pres,
                 st_g = np.concatenate((st_g, np.empty(ns, dtype=np.float64)))
                 st_par = np.concatenate((st_par, np.empty(ns, dtype=np.int64)))
                 st_goal = np.concatenate((st_goal, np.empty(ns, dtype=np.int64)))
+                st_si = np.concatenate((st_si, np.empty(ns, dtype=np.int64)))
             st_node[ns] = nb; st_dir[ns] = nd; st_lp[ns] = nlp; st_vr[ns] = nvr; st_hh[ns] = nhh
-            st_run[ns] = nrun; st_g[ns] = ng; st_par[ns] = sid; st_goal[ns] = goal
-            if goal == 1:
+            st_run[ns] = nrun; st_g[ns] = ng; st_par[ns] = sid; st_goal[ns] = goal; st_si[ns] = st_si[sid]
+            if goal > 0:
                 f = ng
             else:
                 if mode == 0:
-                    j0 = nb // stride[0]; j1 = (nb // n2) % n1; j2 = nb % n2
-                    px = cx[j0]; py = cy[j1]; pz = cz[j2]
-                    hv = cL * (abs(px - tpt[0]) + abs(py - tpt[1]) + abs(pz - tpt[2]))
-                    if a == ta:
-                        if sg != ts:
-                            hv += cB * 2
-                        else:
-                            pa = px if a == 0 else (py if a == 1 else pz)
-                            al = True
-                            if a != 0 and abs(px - tpt[0]) > 1e-9:
-                                al = False
-                            if a != 1 and abs(py - tpt[1]) > 1e-9:
-                                al = False
-                            if a != 2 and abs(pz - tpt[2]) > 1e-9:
-                                al = False
-                            if not (al and (tpt[a] - pa) * ts >= 0):
-                                hv += cB * 2
-                    else:
-                        hv += cB
+                    hv = _h_port(cx[nb // stride[0]], cy[(nb // n2) % n1], cz[nb % n2], a, sg, t_dir, tpt, tcost, cL, cB)
                 else:
                     hv = hl[nb]
                 f = ng + hw * hv
@@ -337,4 +358,5 @@ def search(cx, cy, cz, n0, n1, n2, blocked, eb0, eb1, eb2, halo, hist, pres,
             hf[nh] = f; hs[nh] = ns; nh += 1
             _sift_up(hf, hs, nh - 1)
             ns += 1
-    return st_node[:ns], st_dir[:ns], st_par[:ns], goal_sid, exp, exhausted
+    gj = st_goal[goal_sid] - 1 if goal_sid >= 0 else -1
+    return st_node[:ns], st_dir[:ns], st_par[:ns], goal_sid, exp, exhausted, st_si[:ns], gj
