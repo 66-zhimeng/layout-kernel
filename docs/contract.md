@@ -116,38 +116,83 @@ J = w_A · 占地/A₀ + w_L · 管长/L₀ + w_B · 弯头/B₀ + w_C · 高度
 
 权重在 `params.weights` 里调：更在意占地就调大 `area`，不想多拐弯就调大 `bends`。当前算例下 1 个弯头相当于约 3.4 m 管长，调权重就是在改这个兑换率。
 
-## 5. 参数清单
+## 5. 约束（全部由调用方配置）
 
-`params.routing`（全部必填）：
+约束写在 `params.routing.constraints` 下。**注册表里的每一条都必须写出 `enabled`**；打开时必须给出全部参数；写了不认识的约束名直接报错。内核不写死任何约束，也不设默认值。说明可用 `layout_kernel.constraints.describe()` 取得（可直接生成配置界面）。
+
+| 约束 | 参数 | 含义 | 关闭时 |
+|---|---|---|---|
+| `pipe_pipe_clearance` | `gap_mm` | 不同管外壁之间的最小净距 | 管道之间不避让、不校验 |
+| `pipe_equipment_clearance` | `gap_mm` | 管外壁与设备包围盒的最小净距 | 按 0 处理（可贴、不可穿） |
+| `self_clearance` | `skip_along_mm` | 同一根管上沿管长相隔超过此值的两段也要满足管间净距（防回绕、自交）；依赖 `pipe_pipe_clearance` | 不查 |
+| `height_change_limit` | `max_changes` | 每条支路高度变化次数上限 | 不限 |
+| `ceiling` | `z_max_mm` | 管顶最高标高 | 只受场景范围限制 |
+| `service_zones` | `height_mm` | 设备检修区在此高度以下不得走管 | 忽略检修区 |
+| `straight_lengths` | — | 管件之间的最短直管（弯曲半径 + ℓ_min，或调用方给出的每管、每端规则） | 只要求正交 |
+| `low_pipes` | `zc_max_mm` | 标为 low 的管的中心线最高标高 | 忽略 low 标记 |
+| `junction_merge_exemption` | — | 汇合于同一无盒节点（三通）的几根管，在口附近不算彼此冲突 | 口附近也按管间净距判 |
+| `internal_spools` | — | 节点内部短管是其他管的障碍（接在该节点上的管豁免首末段） | 忽略内部短管 |
+| `equipment_spacing` | `gap_mm` | 移动设备时：设备间距；被移动设备与固定管道之间满足管—设备净距 | 不查 |
+
+示例（与 拆件做网页 的校验口径一致）：
+
+```jsonc
+"constraints": {
+  "pipe_pipe_clearance":      {"enabled": true,  "gap_mm": 25},
+  "pipe_equipment_clearance": {"enabled": true,  "gap_mm": 25},
+  "self_clearance":           {"enabled": true,  "skip_along_mm": 550},
+  "height_change_limit":      {"enabled": false},
+  "ceiling":                  {"enabled": true,  "z_max_mm": 10000},
+  "service_zones":            {"enabled": false},
+  "straight_lengths":         {"enabled": true},
+  "low_pipes":                {"enabled": true,  "zc_max_mm": 3199.9},
+  "junction_merge_exemption": {"enabled": true},
+  "internal_spools":          {"enabled": true},
+  "equipment_spacing":        {"enabled": true,  "gap_mm": 120}
+}
+```
+
+## 6. 求解参数（全部必填）
+
+`params.routing` 中除 `constraints` 外是求解器本身的参数，不是约束：
 
 | 参数 | 含义 |
 |---|---|
-| `D_default_mm` | 管径（本原型所有管网同径） |
-| `c_rho` | 弯曲半径 ρ = c_rho × D |
-| `delta_ep_mm` / `delta_pp_mm` | 设备—管 / 管—管最小净距 |
-| `K` | 每条连接允许的高度变化次数上限 |
+| `D_default_mm` | 缺省管径（每根管可在输入里单独给出） |
+| `c_rho` | 弯曲半径 ρ = c_rho × D（`straight_lengths` 打开时使用） |
 | `eps_z_mm` | 高度容差（校验用） |
-| `z_max_mm` | 管顶最高标高（层高） |
-| `service_zone_height_mm` | 检修区高度，此高度以下不得走管 |
-| `pitch_mm` | 布管网格基础间距 |
-| `margin_mm` | 布管区域在设备外接矩形外的扩展 |
+| `pitch_mm` / `margin_mm` | 布管网格基础间距 / 布管区域在场景外接矩形外的扩展 |
+| `port_side_lines` | 是否在端口坐标两侧加密网格线（大场景可关，控制网格规模） |
 | `max_iters` / `stall_iters` | 协商最多轮数 / 连续多少轮无改进就转入清理 |
 | `pres_fac_init` / `pres_fac_mult` / `hist_fac` | 协商的拥堵与历史代价系数 |
 | `max_expansions` / `astar_weight` | 单次 A* 扩展上限 / 启发式放大系数（1 = 单管最优） |
 | `cleanup_trigger_nets` / `cleanup_max_expansions` | 中途试清理的冲突管网上限 / 清理时的扩展上限 |
 | `freeze_after_exhausted` | 连续几次搜到上限后，协商中不再重搜该管网 |
-| `route_workers` | 并行布管进程数（与 `task.workers` 各管各的，不互相覆盖） |
+| `route_workers` | 并行布管进程数 |
 
 `params.blocking`（全部必填）：`auto_module_policy`（`accept` / `report_only`）、`min_copies`、`min_members`、`module_rotations`、`module_aspect_bands`、`module_solve_s`、`cluster_max_units`、`cluster_resolution`、`seed`。
 
-## 6. 还没有的能力
+## 7. 三维场景接口（接入已有项目）
 
-以下都还**不在**契约里，按需再加：
+已有项目自己管理设备实例、姿态和管路时，不必写任务书，直接用场景接口：
+
+```bash
+layout-kernel-scene < 请求.json > 结果.json        # 或 python -m layout_kernel.scene_cli
+```
+
+- 请求：`{"input": 场景, "settings": {"routing": 求解参数 + constraints, "weights", "scale", "oblique_stub_mm", "pipe_rules"}}`
+- 场景：`nodes`（每个节点当前姿态下的端口位置与法向、包围盒、内部短管、是否可移动）、`routes`（两端端口、现有折点、外径、两端直颈长度、是否固定、是否 low）、`radius`（可移动节点每轴移动范围）、`seconds`（时间上限）。坐标为米制、Y 向上。
+- 结果：`{ok, violations, metrics, routes, offsets, moves, cost, base_cost, timing}`。`offsets` 是被移动节点的平移（米，Y 向上）。
+- `pipe_rules` 用来把调用方自己的直管 / 弯头规则换算成内核的直管长度要求（见 `scene._straight_rules`）；只在 `straight_lengths` 打开时生效。
+
+详见 `src/layout_kernel/scene.py` 模块说明。
+
+## 8. 还没有的能力
 
 | 需求 | 现状 |
 |---|---|
-| 指定某根管道的走法（锁定已有管路） | 未实现。清理步骤里已有“其他管作硬障碍”的机制，反过来用即可，工作量小 |
-| 禁止设备放在某区域 | 未实现（`keepout` 只挡管道），要在摆放的序列对约束里加区域排除，工作量中等 |
-| 按单根管设权重 | 未实现，工作量小 |
+| 设备旋转、三通换向（场景接口） | 未实现，目前只做平移 |
+| 禁止设备放在某区域 | 未实现（`keepout` 只挡管道） |
+| 按单根管设权重 | 未实现 |
 | 设备之间的相对关系约束（必须相邻、必须靠墙） | 未实现 |
-| 变径、斜三通、不同管径 | 未实现，模型本身也还没定义 |
+| 最优性证明 / 下界与差距 | 未实现，当前为启发式 |

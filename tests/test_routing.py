@@ -8,11 +8,26 @@ import pytest
 
 from layout_kernel import routing as rt
 
-RP = {"D_default_mm": 200, "c_rho": 1.5, "delta_ep_mm": 100, "delta_pp_mm": 100, "K": 1, "eps_z_mm": 1,
-      "z_max_mm": 3000, "service_zone_height_mm": 2000, "pitch_mm": 300, "margin_mm": 1500, "max_iters": 10,
+def cons(K=1, z_max=3000, zone=2000, gap=100, skip=0):
+    """测试用约束配置：每一条都显式写出（内核不设默认值）。"""
+    return {"pipe_pipe_clearance": {"enabled": True, "gap_mm": gap},
+            "pipe_equipment_clearance": {"enabled": True, "gap_mm": gap},
+            "self_clearance": {"enabled": True, "skip_along_mm": skip},
+            "height_change_limit": {"enabled": True, "max_changes": K},
+            "ceiling": {"enabled": True, "z_max_mm": z_max},
+            "service_zones": {"enabled": True, "height_mm": zone},
+            "straight_lengths": {"enabled": True},
+            "low_pipes": {"enabled": False},
+            "junction_merge_exemption": {"enabled": True},
+            "internal_spools": {"enabled": True},
+            "equipment_spacing": {"enabled": False}}
+
+
+RP = {"D_default_mm": 200, "c_rho": 1.5, "eps_z_mm": 1, "constraints": cons(),
+      "pitch_mm": 300, "margin_mm": 1500, "max_iters": 10,
       "pres_fac_init": 0.5, "pres_fac_mult": 1.6, "hist_fac": 0.5, "max_expansions": 300000, "astar_weight": 1.0, "route_workers": 1,
       "stall_iters": 3, "cleanup_max_expansions": 300000, "cleanup_trigger_nets": 2,
-      "freeze_after_exhausted": 2, "port_side_lines": True, "self_skip_mm": 0}
+      "freeze_after_exhausted": 2, "port_side_lines": True}
 W = {"area": 1.0, "length": 1.0, "bends": 0.3, "height_changes": 0.3}
 SCALE = {"A0": 1e7, "L0": 1e4, "B0": 1, "C0": 1, "kappa": 2, "l_min_mm": 300}
 
@@ -22,7 +37,10 @@ def box(x0, y0, w, h, ht=1000, ports=None, zones=()):
 
 
 def scene(devices, nets, **over):
+    K = over.pop("K", None)
     rp = {**RP, **over}
+    if K is not None:                                                  # 测试里按需放宽高度变化次数
+        rp["constraints"] = cons(K=K)
     return rt.Scene(devices, nets, rp, W, SCALE)
 
 
@@ -36,9 +54,30 @@ def route_one(sc):
     return routes, hist
 
 
+def test_constraints_must_be_explicit_and_known():
+    with pytest.raises(KeyError, match="缺少"):
+        rt.Scene({}, [], {**RP, "constraints": {k: v for k, v in cons().items() if k != "ceiling"}}, W, SCALE)
+    with pytest.raises(KeyError, match="未知的约束"):
+        rt.Scene({}, [], {**RP, "constraints": {**cons(), "拼错的约束": {"enabled": True}}}, W, SCALE)
+    with pytest.raises(KeyError, match="缺少参数"):
+        rt.Scene({}, [], {**RP, "constraints": {**cons(), "ceiling": {"enabled": True}}}, W, SCALE)
+
+
+def test_disabled_constraint_is_not_enforced():
+    """关闭高度变化上限后，原本违反 K=1 的路径不再报违规；关闭管间净距后，两管贴近也不报。"""
+    dev = two_facing(gap=3000)
+    nets = [{"id": "n", "terms": [("A", "p"), ("B", "q")]}]
+    pts = [(1000, 500, 500), (1600, 500, 500), (1600, 500, 1400), (2200, 500, 1400), (2200, 500, 500), (4000, 500, 500)]
+    route = {"n": [{"start": ("A", "p"), "end": ("port", ("B", "q")), "points": pts}]}
+    on = rt.Scene(dev, nets, {**RP, "constraints": cons(K=0)}, W, SCALE)
+    off = rt.Scene(dev, nets, {**RP, "constraints": {**cons(K=0), "height_change_limit": {"enabled": False}}}, W, SCALE)
+    assert any("高度变化" in v for v in rt.check_routes(on, route)[0])
+    assert not any("高度变化" in v for v in rt.check_routes(off, route)[0])
+
+
 def test_missing_param_raises():
-    rp = dict(RP); del rp["K"]
-    with pytest.raises(KeyError, match="K"):
+    rp = dict(RP); del rp["pitch_mm"]
+    with pytest.raises(KeyError, match="pitch_mm"):
         rt.Scene(two_facing(), [], rp, W, SCALE)
 
 
@@ -184,7 +223,7 @@ def test_fixed_route_is_hard_obstacle_and_checked():
     dev = two_facing(gap=4000)
     nets = [{"id": "n1", "terms": [("A", "p"), ("B", "q")]}]
     wall = {"锁定管": {"points": [(2500, -3000, 500), (2500, 4000, 500)], "D_mm": 200}}
-    sc = rt.Scene(dev, nets, {**RP, "K": 3}, W, SCALE, wall)
+    sc = rt.Scene(dev, nets, {**RP, "constraints": cons(K=3)}, W, SCALE, wall)
     routes, _hist = route_one(sc)
     viol, _ = rt.check_routes(sc, routes)
     assert viol == [] and len(routes["n1"][0]["points"]) > 2       # 不能直穿，必须绕开

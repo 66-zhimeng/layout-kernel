@@ -38,13 +38,15 @@ from itertools import count
 import numpy as np
 
 from . import astar_fast as af
+from . import constraints as cons
 
 DIRS = [(0, 1), (0, -1), (1, 1), (1, -1), (2, 1), (2, -1)]      # (轴, 符号)
 DIR_OF = {(1, 0, 0): 0, (-1, 0, 0): 1, (0, 1, 0): 2, (0, -1, 0): 3, (0, 0, 1): 4, (0, 0, -1): 5}
-REQUIRED = ["D_default_mm", "c_rho", "delta_ep_mm", "delta_pp_mm", "K", "eps_z_mm", "z_max_mm",
-            "service_zone_height_mm", "pitch_mm", "margin_mm", "max_iters", "pres_fac_init", "pres_fac_mult",
+# 求解参数（网格、协商、搜索）。约束一律在 "constraints" 下由调用方开关与配置，见 constraints.py
+REQUIRED = ["D_default_mm", "c_rho", "eps_z_mm", "pitch_mm", "margin_mm", "max_iters", "pres_fac_init", "pres_fac_mult",
             "hist_fac", "max_expansions", "astar_weight", "route_workers", "stall_iters", "cleanup_max_expansions",
-            "cleanup_trigger_nets", "freeze_after_exhausted", "port_side_lines", "self_skip_mm"]
+            "cleanup_trigger_nets", "freeze_after_exhausted", "port_side_lines", "constraints"]
+UNLIMITED_CHANGES = 1000                                       # 高度变化次数不限时的内部上限（远超实际可能）
 
 
 def check_params(rp, weights):
@@ -71,7 +73,19 @@ class Scene:
         self.fixed_routes = fixed_routes or {}
         # 节点内部短管（如三通内的接管）：[{"owner", "points", "D_mm"}]。对其他管是障碍；
         # 接在该节点上的管豁免（校验时只豁免这根管的首段与末段，与网页 full-routing.js 的 fixedSpools 规则一致）
-        self.spools = spools or []
+        c = cons.validate(rp["constraints"])
+        self.cons = c
+        self.pp_on = c["pipe_pipe_clearance"]["enabled"]
+        self.gap_pp = c["pipe_pipe_clearance"]["gap_mm"] if self.pp_on else 0.0
+        self.gap_ep = c["pipe_equipment_clearance"]["gap_mm"] if c["pipe_equipment_clearance"]["enabled"] else 0.0
+        self.self_on = c["self_clearance"]["enabled"]
+        self.self_skip = c["self_clearance"]["skip_along_mm"] if self.self_on else 0.0
+        self.K = c["height_change_limit"]["max_changes"] if c["height_change_limit"]["enabled"] else UNLIMITED_CHANGES
+        self.z_ceiling = c["ceiling"]["z_max_mm"] if c["ceiling"]["enabled"] else None
+        self.zone_h = c["service_zones"]["height_mm"] if c["service_zones"]["enabled"] else None
+        self.straight_on = c["straight_lengths"]["enabled"]
+        self.merge_exempt = c["junction_merge_exemption"]["enabled"]
+        self.spools = (spools or []) if c["internal_spools"]["enabled"] else []
         # “管件式”端口：端口外已有管件（如斜支口伸出段末端的 45° 弯），出入时按弯头计直管长度
         self.fitting_ports = {(did, pn) for did, d in devices.items() for pn in d.get("fitting_ports", ())}
         self.lmin = scale["l_min_mm"]
@@ -80,23 +94,27 @@ class Scene:
         self.np = {}                                            # 每根管的参数
         for n in nets:
             D = n.get("D_mm", D0)
-            zc = min(rp["z_max_mm"] - D / 2, n.get("zc_max_mm", math.inf))
-            self.np[n["id"]] = {"D": D, "rho": n.get("rho_mm", rp["c_rho"] * D),
-                                "lmin": max(self.lmin, n.get("lead_mm", 0.0)), "zc_max": zc,
-                                "port_straight": {(dev, pn): n["port_straight_mm"][pn]
-                                                  for dev, pn in n["terms"] if pn in n.get("port_straight_mm", {})}}
+            top = (self.z_ceiling - D / 2) if self.z_ceiling is not None else math.inf
+            zc = min(top, n.get("zc_max_mm", math.inf))
+            if self.straight_on:
+                self.np[n["id"]] = {"D": D, "rho": n.get("rho_mm", rp["c_rho"] * D),
+                                    "lmin": max(self.lmin, n.get("lead_mm", 0.0)), "zc_max": zc,
+                                    "port_straight": {(dev, pn): n["port_straight_mm"][pn]
+                                                      for dev, pn in n["terms"] if pn in n.get("port_straight_mm", {})}}
+            else:                                                       # 不限直管长度：只要求正交
+                self.np[n["id"]] = {"D": D, "rho": 0.0, "lmin": 0.0, "zc_max": zc, "port_straight": {}}
         # 包络管径：障碍膨胀、占用晕、网格线都按最大管径取，保守
         self.D = max([D0] + [v["D"] for v in self.np.values()] + [f["D_mm"] for f in self.fixed_routes.values()])
         self.rho = rp["c_rho"] * D0
-        self.r_ep = rp["delta_ep_mm"] + self.D / 2
-        self.r_pp = self.D + rp["delta_pp_mm"]
+        self.r_ep = self.gap_ep + self.D / 2
+        self.r_pp = self.D + self.gap_pp
         self.boxes = []                                         # (x0,y0,z0,x1,y1,z1, r, owner)
-        zh = rp["service_zone_height_mm"]
         for did, d in devices.items():
             if d["box"] is not None:
                 self.boxes.append((*d["box"], self.r_ep, did))
-            for zx0, zy0, zx1, zy1 in d["zones"]:
-                self.boxes.append((zx0, zy0, 0, zx1, zy1, zh, self.D / 2, None))
+            if self.zone_h is not None:
+                for zx0, zy0, zx1, zy1 in d["zones"]:
+                    self.boxes.append((zx0, zy0, 0, zx1, zy1, self.zone_h, self.D / 2, None))
 
     def net_param(self, nid):
         return self.np[nid]
@@ -116,7 +134,11 @@ class Grid:
         xs0, ys0 = min(q[0] for q in pts) - mg, min(q[1] for q in pts) - mg
         xs1, ys1 = max(q[0] for q in pts) + mg, max(q[1] for q in pts) + mg
         port_z = [v[2] for d in sc.dev.values() for v in d["ports"].values()]
-        zlo, zhi = min([D / 2] + port_z), rp["z_max_mm"] - D / 2
+        if sc.z_ceiling is not None:
+            zhi = sc.z_ceiling - D / 2
+        else:                                                           # 不限顶高：场景最高点之上再留 margin
+            zhi = max(q[2] for q in pts) + mg
+        zlo = min([D / 2] + port_z)
         lim = [(xs0, xs1), (ys0, ys1), (zlo, zhi)]
         cs = [set(), set(), set()]
         for a in (0, 1):
@@ -304,13 +326,13 @@ def astar(G, sc, start, target, ctx):
         goal_info = ("tee", None)
     out = af.search(G.carr[0], G.carr[1], G.carr[2], G.n[0], G.n[1], G.n[2], G.blocked,
                     G.eblocked[0], G.eblocked[1], G.eblocked[2], ha, hi_, float(ctx["pres"]),
-                    ex_nodes, ex_edges, float(ctx["rho"]), float(ctx["lmin"]), int(sc.rp["K"]), float(ctx["zc_max"]),
+                    ex_nodes, ex_edges, float(ctx["rho"]), float(ctx["lmin"]), int(sc.K), float(ctx["zc_max"]),
                     cL, cB, cC, float(sc.rp["astar_weight"]), int(sc.rp["max_expansions"]),
                     int(s0), int(d0), mode, int(t), int(t_dir), tpt, hl,
                     tnode, ttype, tsa, tdA, tdB, tkA, tkB, tcor,
                     0 if tuple(start) in sc.fitting_ports else 1,
                     _target_extra(sc, target, ctx),
-                    float(ctx.get("self_clear", 0.0)), _start_run(ctx, start), float(sc.rp["self_skip_mm"]))
+                    float(ctx.get("self_clear", 0.0)), _start_run(ctx, start), float(sc.self_skip))
     nodes, dirs, par, gid, exp, exhausted = out
     ctx["stats"]["expansions"] += int(exp)
     if gid < 0:
@@ -369,7 +391,7 @@ def tree_arrays(nodes):
 def astar_py(G, sc, start, target, ctx):
     """纯 Python 参考实现（测试中与 astar 比对；规则以本函数与文档为准）。
     start = (dev, port)；target = ("port", (dev, port)) 或 ("tree", tree)。返回 (折线点列表, 结束信息) 或 None。"""
-    rho, lmin, K, zc_max = ctx["rho"], ctx["lmin"], sc.rp["K"], ctx["zc_max"]
+    rho, lmin, K, zc_max = ctx["rho"], ctx["lmin"], sc.K, ctx["zc_max"]
     cap = 2 * rho + lmin                                           # 目标端要求更长时在下方放宽
     cL = sc.w["length"] / sc.scale["L0"]
     cB = sc.w["bends"] / sc.scale["B0"]
@@ -445,7 +467,7 @@ def astar_py(G, sc, start, target, ctx):
         n, d, lp, vr, hh, run, g, parent, goal = states[sid]
         if goal is not None:
             pts_ = _trace(G, states, sid)
-            if self_clear > 0 and _self_close_py(pts_, self_clear, sc.rp["self_skip_mm"]):
+            if self_clear > 0 and _self_close_py(pts_, self_clear, sc.self_skip):
                 continue                                           # 与编译实现相同：自己挨得太近的路径不接受
             ctx["stats"]["expansions"] += exp
             return pts_, goal
@@ -670,7 +692,9 @@ def tree_segments(branches, stats=None):
 def halo_codes(G, sc, branches, D=None):
     """占用晕：与管道中心线（轴对齐盒）各轴距离都 < r_pp 的全部边，返回边编码 节点×3+轴 的有序数组。
     条件在三个轴上可分离：垂直于边的轴看节点坐标，沿边的轴看边区间，各得一个布尔掩码，取笛卡尔积。"""
-    r = (sc.D if D is None else D) / 2 + sc.D / 2 + sc.rp["delta_pp_mm"] - 1e-9   # 本管半径 + 最大管半径 + 净距
+    if not sc.pp_on:                                                   # 不要求管间净距：不占用、不避让
+        return np.zeros(0, dtype=np.int64)
+    r = (sc.D if D is None else D) / 2 + sc.D / 2 + sc.gap_pp - 1e-9   # 本管半径 + 最大管半径 + 净距
     C = G.carr
     ny, nz = G.n[1], G.n[2]
     parts = []
@@ -697,7 +721,7 @@ def clash_segments(sc, br):
     """参与管—管冲突判断的管段：在“无盒节点”（三通等汇合点）的端口处各去掉一段 r_pp。
     几根管在同一个三通上汇合，口之间只隔几厘米，汇合处附近的相互接近由三通配件本身决定，不算冲突。"""
     segs = [(tuple(p), tuple(q)) for p, q in zip(br["points"], br["points"][1:])]
-    trim = br.get("trim")
+    trim = br.get("trim") if sc.merge_exempt else (False, False)
     if trim is None:
         start = sc.dev[br["start"][0]]["box"] is None if "start" in br else False
         end = br["end"][0] == "port" and sc.dev[br["end"][1][0]]["box"] is None if "end" in br else False
@@ -782,7 +806,7 @@ def _route_net(G, sc, net, ctx):
     if bad:
         return None, "端口正前方不足 ℓ_min：" + "、".join(f"{d}.{p}" for d, p in bad)
     ctx = {**ctx, "ex_nodes": ex_nodes, "ex_edges": ex_edges, "rho": npar["rho"], "lmin": npar["lmin"],
-           "zc_max": npar["zc_max"], "self_clear": npar["D"] + sc.rp["delta_pp_mm"], "inside": inside,
+           "zc_max": npar["zc_max"], "self_clear": (npar["D"] + sc.gap_pp) if sc.self_on else 0.0, "inside": inside,
            "port_straight": npar["port_straight"]}
     P = {t: sc.port(*t)[:3] for t in terms}
     man = lambda u, v: sum(abs(P[u][a] - P[v][a]) for a in range(3))
@@ -1107,7 +1131,7 @@ def cleanup(G, sc, routes, log=print):
 # ============================================================ 独立校验器
 def check_routes(sc, routes):
     """只依据折线几何检查规则并计算指标。返回 (违规列表, 指标)。"""
-    K = sc.rp["K"]
+    K = sc.K
     eps = sc.rp["eps_z_mm"]
     viol = []
     per_net, all_boxes = {}, []
@@ -1155,13 +1179,13 @@ def check_routes(sc, routes):
                     in_v, dz, had_h = False, 0.0, True
             if nl > K:
                 viol.append(f"{nid} 支路 {bi}：高度变化 {nl} > K={K}")
-            sg = segments_of(pts)                                       # 自相交：沿管长相隔 > self_skip_mm 的两段也要留净距
+            sg = segments_of(pts)                                       # 自相交：沿管长相隔 > skip_along_mm 的两段也要留净距
             sl = [sum(abs(q[k] - p[k]) for k in range(3)) for p, q in sg]
-            for i in range(len(sg)):
+            for i in (range(len(sg)) if sc.self_on else ()):
                 for j in range(i + 2, len(sg)):
-                    if sum(sl[i + 1:j]) <= sc.rp["self_skip_mm"]:
+                    if sum(sl[i + 1:j]) <= sc.self_skip:
                         continue
-                    if _gap(_box(*sg[i], D / 2), _box(*sg[j], D / 2)) < sc.rp["delta_pp_mm"] - 1e-6:
+                    if _gap(_box(*sg[i], D / 2), _box(*sg[j], D / 2)) < sc.gap_pp - 1e-6:
                         viol.append(f"{nid} 支路 {bi}：管段 {i} 与管段 {j} 自相交或净距不足")
             layers += nl
         if seen != terms:
@@ -1202,7 +1226,7 @@ def check_routes(sc, routes):
                 s = 1 if q[a] > p[a] else -1
                 pp, qq = list(p), list(q)
                 trim_dev = set()
-                trim = sc.rp["delta_ep_mm"] + D / 2
+                trim = sc.gap_ep + D / 2
                 if k == 0:
                     pp[a] += s * _exit_len(sc, dev0, p, a, s, trim); trim_dev.add(dev0)
                 if k == len(sg) - 1 and dev1:
@@ -1212,13 +1236,13 @@ def check_routes(sc, routes):
                 for did, d in sc.dev.items():
                     b = d["box"]
                     tgt = chk if did in trim_dev else full
-                    if b is not None and tgt is not None and _gap(tgt, b) < sc.rp["delta_ep_mm"] - 1e-6:
+                    if b is not None and tgt is not None and _gap(tgt, b) < sc.gap_ep - 1e-6:
                         viol.append(f"{nid}：管段 {p}→{q} 与设备 {did} 净距不足")
-                    for zx0, zy0, zx1, zy1 in d["zones"]:
-                        zb = (zx0, zy0, 0, zx1, zy1, sc.rp["service_zone_height_mm"])
+                    for zx0, zy0, zx1, zy1 in (d["zones"] if sc.zone_h is not None else ()):
+                        zb = (zx0, zy0, 0, zx1, zy1, sc.zone_h)
                         if _gap(full, zb) < 0 - 1e-6:
                             viol.append(f"{nid}：管段 {p}→{q} 穿过 {did} 的检修区")
-                if full[5] > sc.rp["z_max_mm"] + 1e-6 or max(p[2], q[2]) > npar["zc_max"] + 1e-6:
+                if (sc.z_ceiling is not None and full[5] > sc.z_ceiling + 1e-6) or max(p[2], q[2]) > npar["zc_max"] + 1e-6:
                     viol.append(f"{nid}：管段 {p}→{q} 超出高度范围")
         all_boxes.append((nid, [_box(p, q, D / 2) for br in brs for p, q in clash_segments(sc, br)]))
         per_net[nid] = {"L_mm": L, "bends": bends, "height_changes": layers, "branches": len(brs)}
@@ -1232,7 +1256,7 @@ def check_routes(sc, routes):
                 for k, (p, q) in enumerate(sg):
                     if sp["owner"] in ends and (k == 0 or k == len(sg) - 1):
                         continue
-                    if any(_gap(_box(p, q, D / 2), b) < sc.rp["delta_pp_mm"] - 1e-6 for b in sboxes):
+                    if any(_gap(_box(p, q, D / 2), b) < sc.gap_pp - 1e-6 for b in sboxes):
                         viol.append(f"{nid}：管段 {p}→{q} 穿过 {sp['owner']} 的内部短管")
                         break
     for fid, f in sc.fixed_routes.items():                             # 固定管路只参与净距，不计指标
@@ -1241,11 +1265,11 @@ def check_routes(sc, routes):
                                 clash_segments(sc, {"points": pts, "trim": f.get("trim", (False, False))})]))
     for i in range(len(all_boxes)):
         for j in range(i + 1, len(all_boxes)):
-            if all_boxes[i][0] in sc.fixed_routes and all_boxes[j][0] in sc.fixed_routes:
+            if not sc.pp_on or (all_boxes[i][0] in sc.fixed_routes and all_boxes[j][0] in sc.fixed_routes):
                 continue                                               # 两根都是给定的固定管路：不是本次求解的结果，不判
             for bi in all_boxes[i][1]:
                 for bj in all_boxes[j][1]:
-                    if _gap(bi, bj) < sc.rp["delta_pp_mm"] - 1e-6:
+                    if _gap(bi, bj) < sc.gap_pp - 1e-6:
                         viol.append(f"{all_boxes[i][0]} 与 {all_boxes[j][0]}：管–管净距不足")
                         break
                 else:

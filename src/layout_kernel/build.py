@@ -73,5 +73,7 @@ def scene(inst, blocks, nets, P, sol, keepout=()):
 
 def placement_margins(rp):
     """摆放时按侧预留出管空间所需的配置（方法 B；见 布管原型/README.md 第 5 节）。"""
-    return {"D_mm": rp["D_default_mm"], "delta_pp_mm": rp["delta_pp_mm"],
-            "delta_ep_mm": rp["delta_ep_mm"], "c_rho": rp["c_rho"]}
+    c = rp["constraints"]
+    gap = lambda k: c[k]["gap_mm"] if c[k]["enabled"] else 0.0   # noqa: E731
+    return {"D_mm": rp["D_default_mm"], "delta_pp_mm": gap("pipe_pipe_clearance"),
+            "delta_ep_mm": gap("pipe_equipment_clearance"), "c_rho": rp["c_rho"]}

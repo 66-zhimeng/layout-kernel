@@ -10,7 +10,7 @@
 settings（全部必填）：
   routing:   布管参数（毫米，同 routing.REQUIRED；D_default_mm 仅作缺省，实际按每根管的外径）
   weights / scale：目标权重与归一化尺度（同 routing.Scene）
-  low_zc_max_mm：low 管中心线最高标高（网页规则：机房低位管道须低于 3.2 m）
+  约束开关与参数一律在 routing.constraints 下（见 constraints.py）；本模块用到 low_pipes、equipment_spacing
   oblique_stub_mm：斜向端口在基线里找不到斜段时，沿法向伸出的短管长度
   pipe_rules：对方的直管规则，用来推算每根管的 rho / lead（见 _straight_rules）：
     {"trim_ratio": 弯头最多占相邻直管的比例, "radius_margin_mm": 有效弯曲半径须超过管半径的量,
@@ -23,13 +23,14 @@ settings（全部必填）：
 import math
 import time
 
+from . import constraints
 from . import routing as rt
-SETTINGS_REQUIRED = ["routing", "weights", "scale", "low_zc_max_mm", "oblique_stub_mm", "pipe_rules"]
+SETTINGS_REQUIRED = ["routing", "weights", "scale", "oblique_stub_mm", "pipe_rules"]
 SERIAL_NETS = 8                                                 # 每个并行进程至少分到的管数
 RULES_REQUIRED = ["trim_ratio", "radius_margin_mm", "port_margin_mm", "safety", "rule_D_mm", "rule_R_mm"]
 
 
-def _straight_rules(D_pipe, leads, rules, delta_pp):
+def _straight_rules(leads, rules):
     """把对方的直管规则换算成内核的 (rho, lmin)。内核要求：两弯之间直管 ≥ 2·rho + lmin，端口到弯 ≥ rho + lmin。
     对方（网页 pipeSections / dimensionalSections）：弯头让位 trim = min(R, trim_ratio·相邻直管)，有效半径 trim 须
     > D/2 + margin；端口处去掉让位后的直管 ≥ 直颈 + 变径（lead）+ port_margin。于是
@@ -107,6 +108,7 @@ def build_scene(inp, settings, fixed_ids=(), deltas=None):
     if miss:
         raise KeyError(f"场景布管缺少设置：{miss}（不设默认值）")
     rp = dict(settings["routing"])
+    cons_cfg = constraints.validate(rp.get("constraints"))
     miss = [k for k in RULES_REQUIRED if k not in settings["pipe_rules"]]
     if miss:
         raise KeyError(f"pipe_rules 缺少：{miss}")
@@ -147,14 +149,13 @@ def build_scene(inp, settings, fixed_ids=(), deltas=None):
             ends = [devices[port_owner[r[k]["key"]]]["box"] is None for k in ("from", "to")]
             fixed[r["id"]] = {"points": [to_k(q) for q in r["points"]], "D_mm": round(D, 1), "trim": ends}
             continue
-        rho, lmin, (ps_a, ps_b) = _straight_rules(D, (1000 * r["leadA"], 1000 * r["leadB"]), settings["pipe_rules"],
-                                                  rp["delta_pp_mm"])
+        rho, lmin, (ps_a, ps_b) = _straight_rules((1000 * r["leadA"], 1000 * r["leadB"]), settings["pipe_rules"])
         ka, kb = r["from"]["key"], r["to"]["key"]
         net = {"id": r["id"], "terms": [(port_owner[ka], ka), (port_owner[kb], kb)],
                "D_mm": round(D, 1), "rho_mm": rho, "lead_mm": lmin,
                "port_straight_mm": {k_: v for k_, v in ((ka, ps_a), (kb, ps_b)) if k_ not in stubs}}
-        if r.get("low"):
-            net["zc_max_mm"] = settings["low_zc_max_mm"]
+        if r.get("low") and cons_cfg["low_pipes"]["enabled"]:
+            net["zc_max_mm"] = cons_cfg["low_pipes"]["zc_max_mm"]
         nets.append(net)
         meta[r["id"]] = {"code": r.get("code"), "from": r["from"]["key"], "to": r["to"]["key"]}
     # 节点内部短管（三通内的接管等）：对不接在该节点上的管是障碍；随节点平移
@@ -174,8 +175,35 @@ def build_scene(inp, settings, fixed_ids=(), deltas=None):
     return sc, {"stubs": stubs, "port_w": port_w, "meta": meta}
 
 
+def _moved_violations(sc, deltas):
+    """equipment_spacing：被移动设备的包围盒与其他设备的间距，及与固定管道（不参与本次布管）的净距。"""
+    c = sc.cons["equipment_spacing"]
+    if not deltas or not c["enabled"]:
+        return []
+    out = []
+    boxes = {did: d["box"] for did, d in sc.dev.items() if d["box"] is not None}
+    for nid in deltas:
+        b = boxes.get(nid)
+        if b is None:
+            continue
+        for oid, ob in boxes.items():
+            if oid != nid and rt._gap(b, ob) < c["gap_mm"] - 1e-6:
+                out.append(f"移动后 {nid} 与 {oid} 设备间距不足")
+        for fid, f in sc.fixed_routes.items():
+            pts = [tuple(q) for q in f["points"]]
+            for p, q in zip(pts, pts[1:]):
+                if rt._gap(rt._box(p, q, f["D_mm"] / 2), b) < sc.gap_ep - 1e-6:
+                    out.append(f"移动后 {nid} 与固定管道 {fid} 净距不足")
+                    break
+    return out
+
+
 def _route_once(inp, settings, fixed_ids=(), deltas=None, log=None):
     sc, meta = build_scene(inp, settings, fixed_ids, deltas)
+    moved_viol = _moved_violations(sc, deltas)
+    if moved_viol:                                                   # 移动本身不合法：不必布管
+        return {"sc": sc, "meta": meta, "routes": {}, "viol": moved_viol, "met": {"per_net": {}}, "ok": False,
+                "cost": math.inf, "history": [{}], "G": None}
     routes, history, G = rt.negotiate(sc, log=log or (lambda _l: None))
     viol, met = rt.check_routes(sc, routes)
     ok = not viol and len(routes) == len(sc.nets)

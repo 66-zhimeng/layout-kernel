@@ -17,11 +17,21 @@ TYPES = {
     "水箱": {"height": 1500, "size": [1500, 1500], "rotations": [0, 90, 180, 270], "service_zones": [],
              "ports": {"out": {"pos": [700, 0], "dir": [0, -1], "z": 700}}},
 }
-ROUTING = {"D_default_mm": 200, "c_rho": 1.5, "delta_ep_mm": 100, "delta_pp_mm": 100, "K": 3, "eps_z_mm": 1,
-           "z_max_mm": 4500, "service_zone_height_mm": 2000, "pitch_mm": 300, "margin_mm": 1500,
+CONSTRAINTS = {"pipe_pipe_clearance": {"enabled": True, "gap_mm": 100},
+               "pipe_equipment_clearance": {"enabled": True, "gap_mm": 100},
+               "self_clearance": {"enabled": True, "skip_along_mm": 0},
+               "height_change_limit": {"enabled": True, "max_changes": 3},
+               "ceiling": {"enabled": True, "z_max_mm": 4500},
+               "service_zones": {"enabled": True, "height_mm": 2000},
+               "straight_lengths": {"enabled": True},
+               "low_pipes": {"enabled": False},
+               "junction_merge_exemption": {"enabled": True},
+               "internal_spools": {"enabled": True},
+               "equipment_spacing": {"enabled": False}}
+ROUTING = {"D_default_mm": 200, "c_rho": 1.5, "eps_z_mm": 1, "constraints": CONSTRAINTS, "pitch_mm": 300, "margin_mm": 1500,
            "max_iters": 20, "pres_fac_init": 0.5, "pres_fac_mult": 1.6, "hist_fac": 0.5,
            "max_expansions": 300000, "astar_weight": 1.5, "route_workers": 1, "stall_iters": 6,
-           "cleanup_trigger_nets": 4, "cleanup_max_expansions": 300000, "freeze_after_exhausted": 2, "port_side_lines": True, "self_skip_mm": 0}
+           "cleanup_trigger_nets": 4, "cleanup_max_expansions": 300000, "freeze_after_exhausted": 2, "port_side_lines": True}
 BLOCKING = {"auto_module_policy": "report_only", "min_copies": 2, "min_members": 2,
             "module_rotations": [0, 90, 180, 270], "module_aspect_bands": [[1, 1.5]],
             "module_solve_s": 1, "cluster_max_units": 25, "cluster_resolution": 1.0, "seed": 0}
@@ -100,7 +110,7 @@ def test_keepout_box_blocks_pipes():
     (lambda c: c["devices"][0].update(fixed=[123, 0]), "网格"),
     (lambda c: c["devices"][0].update(placed=[0, 0, 45]), "旋转角"),
     (lambda c: c["nets"][0].update(terminals=["泵1.没有这个端口", "机组1.in"]), "端口"),
-    (lambda c: c["params"]["routing"].pop("K"), "K"),
+    (lambda c: c["params"]["routing"]["constraints"].pop("ceiling"), "ceiling"),
     (lambda c: c.update(keepout=[[0, 0, 0, 0, 1, 1]]), "下界"),
     (lambda c: c["device_types"]["泵"]["ports"]["in"].update(pos=[0, 450]), "整数倍"),
     (lambda c: c["device_types"]["泵"]["ports"]["in"].update(dir=[1, 1]), "单位向量"),

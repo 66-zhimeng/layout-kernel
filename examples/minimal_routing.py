@@ -11,14 +11,23 @@ from layout_kernel import routing as rt
 ROUTING = {
     "D_default_mm": 200,            # 管径（本原型所有管网同径）
     "c_rho": 1.5,                   # 弯曲半径 ρ = c_rho × D
-    "delta_ep_mm": 100,             # 设备—管最小净距
-    "delta_pp_mm": 100,             # 管—管最小净距
-    "K": 3,                         # 每条连接允许的高度变化次数上限
     "eps_z_mm": 1,                  # 高度容差（校验用）
-    "z_max_mm": 4500,               # 管顶最高标高（层高）
-    "service_zone_height_mm": 2000,  # 检修区高度：此高度以下不得走管
     "pitch_mm": 300,                # 布管网格的基础间距
     "margin_mm": 1500,              # 布管区域在设备外接矩形外的扩展
+    # —— 约束：每一条都显式开关（见 layout_kernel/constraints.py，可用 layout_kernel.constraints.describe() 查看说明）
+    "constraints": {
+        "pipe_pipe_clearance":      {"enabled": True, "gap_mm": 100},        # 不同管外壁之间的净距
+        "pipe_equipment_clearance": {"enabled": True, "gap_mm": 100},        # 管外壁与设备包围盒的净距
+        "self_clearance":           {"enabled": True, "skip_along_mm": 0},   # 同一根管沿管长相隔超过此值的两段也要留净距
+        "height_change_limit":      {"enabled": True, "max_changes": 3},     # 每条支路高度变化次数上限
+        "ceiling":                  {"enabled": True, "z_max_mm": 4500},     # 管顶最高标高（层高）
+        "service_zones":            {"enabled": True, "height_mm": 2000},    # 检修区此高度以下不得走管
+        "straight_lengths":         {"enabled": True},                       # 管件之间的最短直管（弯曲半径 + ℓ_min）
+        "low_pipes":                {"enabled": False},                      # 标为 low 的管的中心线高度上限
+        "junction_merge_exemption": {"enabled": True},                       # 汇合于同一三通的管在口附近不算冲突
+        "internal_spools":          {"enabled": True},                       # 三通内部短管是其他管的障碍
+        "equipment_spacing":        {"enabled": False},                      # 移动设备时的设备间距（本示例不移动设备）
+    },
     # —— 协商布线
     "max_iters": 60,                # 协商最多轮数
     "pres_fac_init": 0.5,           # 拥堵代价初值
@@ -32,7 +41,6 @@ ROUTING = {
     "cleanup_max_expansions": 2000000,  # 清理时单次 A* 的扩展上限
     "freeze_after_exhausted": 2,    # 连续几次搜到上限后，协商中不再重搜该管网
     "port_side_lines": True,        # 端口坐标两侧加密网格线（便于贴近端口走管；场景很大时关掉以控制网格规模）
-    "self_skip_mm": 0,              # 同一根管上沿管长相隔超过此值的两段才检查自身净距（0 = 全部检查）
 }
 WEIGHTS = {"area": 1.0, "length": 1.0, "bends": 0.3, "height_changes": 0.3}   # 目标各项权重
 SCALE = {"A0": 1e7, "L0": 1e4, "B0": 25, "C0": 25,   # 归一化尺度：占地 mm²、管长 mm、弯头数、高度变化数

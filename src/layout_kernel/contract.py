@@ -3,6 +3,7 @@
 原则：所有参数必须显式给出，缺失即报错（不设默认值）；报错要指出是哪台设备、哪个端口、哪一项参数。
 """
 from . import blocking as bk
+from . import constraints
 from . import routing as rt
 
 MODES = ("place_and_route", "route_only")
@@ -73,6 +74,10 @@ def validate_case(case):
     if rp is None:
         raise CaseError("params 缺少 routing（布管参数）")
     rt.check_params(rp, case["params"].get("weights", {}))            # 布管参数与权重齐全性
+    try:
+        constraints.validate(rp.get("constraints"))                    # 每条约束都要显式开关
+    except constraints.ConstraintError as ex:
+        raise CaseError(str(ex)) from None
     try:
         inst = bk.load_devices(case)                                   # 设备、端口、管网的合法性
     except (KeyError, ValueError) as ex:

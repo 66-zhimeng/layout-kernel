@@ -40,8 +40,9 @@ class CoarseGrid:
         y1 = max(d["box"][4] for d in sc.dev.values()) + mg
         self.c, self.x0, self.y0 = c, x0, y0
         self.nx, self.ny = int(math.ceil((x1 - x0) / c)), int(math.ceil((y1 - y0) / c))
-        pitch = D + rp["delta_pp_mm"]
-        self.zs = np.arange(D / 2, rp["z_max_mm"] - D / 2 + 1e-9, pitch)
+        pitch = D + sc.gap_pp
+        top = sc.z_ceiling if sc.z_ceiling is not None else max(d["box"][5] for d in sc.dev.values() if d["box"]) + mg
+        self.zs = np.arange(D / 2, top - D / 2 + 1e-9, pitch)
         self.nz = len(self.zs)
         self.xc = x0 + (np.arange(self.nx) + 0.5) * c
         self.yc = y0 + (np.arange(self.ny) + 0.5) * c
@@ -52,8 +53,8 @@ class CoarseGrid:
             r = sc.r_ep
             plan = (X > bx0 - r) & (X < bx1 + r) & (Y > by0 - r) & (Y < by1 + r)
             blocked[plan[:, :, None] & (self.zs[None, None, :] < h + sc.r_ep)] = True
-            zh = rp["service_zone_height_mm"]
-            for zx0, zy0, zx1, zy1 in d["zones"]:
+            zh = sc.zone_h
+            for zx0, zy0, zx1, zy1 in (d["zones"] if zh is not None else ()):
                 plan = (X > zx0 - D / 2) & (X < zx1 + D / 2) & (Y > zy0 - D / 2) & (Y < zy1 + D / 2)
                 blocked[plan[:, :, None] & (self.zs[None, None, :] < zh + D / 2)] = True
         self.blocked = blocked
@@ -96,11 +97,11 @@ def port_stub(G, sc, dev, pn):
     h = sc.D / 2
     ex_, ey_ = x + ux * L, y + uy * L
     seg = (min(x, ex_) - h, min(y, ey_) - h, z - h, max(x, ex_) + h, max(y, ey_) + h, z + h)
-    zh = sc.rp["service_zone_height_mm"]
+    zh = sc.zone_h
     for did, d in sc.dev.items():
-        if did != dev and _gap(seg, d["box"]) < sc.rp["delta_ep_mm"]:
+        if did != dev and _gap(seg, d["box"]) < sc.gap_ep:
             return None
-        for zx0, zy0, zx1, zy1 in d["zones"]:
+        for zx0, zy0, zx1, zy1 in (d["zones"] if zh is not None else ()):
             if _gap(seg, (zx0, zy0, 0, zx1, zy1, zh)) < 0:
                 return None
     n = max(1, int(math.ceil(L / (G.c / 2))))
