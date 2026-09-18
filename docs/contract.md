@@ -188,7 +188,8 @@ layout-kernel-scene < 请求.json > 结果.json        # 或 python -m layout_ke
   - `radius`（每轴移动范围，米）、`seconds`（时间上限）。
   - 可选区域：`equipment_keepout`、`pipe_keepout`（三维盒 `[x0,y0,z0,x1,y1,z1]`，米；是否生效由同名约束决定）。
 - 设置：`routing`（求解参数 + `constraints`）、`weights`、`scale`、`oblique_stub_mm`、`pipe_rules`、
-  `rotation_candidates`（每个可转节点每轮真实重布几种朝向）、`lower_bound`（`{enabled, max_expansions}`）。
+  `rotation_candidates`（每个可转节点每轮真实重布几种朝向）、`lower_bound`（`{enabled, max_expansions}`）、
+  `candidate_routing`（评估候选时覆盖 `routing` 的轻量参数，如 `{max_iters, stall_iters, max_expansions, cleanup_max_expansions}`；最终联合重布仍用 `routing`）。
 
 **结果** `{ok, violations, metrics, routes, offsets, orientations, moves, cost, base_cost, lower_bound, timing}`
 
@@ -196,7 +197,7 @@ layout-kernel-scene < 请求.json > 结果.json        # 或 python -m layout_ke
 - `lower_bound`：`{valid, value, cost, gap, nets, unresolved, note}`。设备位置与朝向固定为最终方案时，各两端点管单独求精确最短路（不考虑其他待布管、放宽同管自身净距）之和；`gap = (cost − value) / cost` 是当前方案离这一下界的最大相对差距。它**不是**设备也能移动时的全局下界；多端点管网不给下界。
 - `pipe_rules` 用来把调用方自己的直管 / 弯头规则换算成内核的直管长度要求（见 `scene._straight_rules`），只在 `straight_lengths` 打开时生效。
 
-**优化过程**：先按当前姿态重布；再逐个试候选（串联拉直、单个对齐、换朝向），每个候选只重布相连的管、其余固定，代价下降就接受；最后按最终姿态联合重布一次取更好者。换朝向的候选先按“端口间曼哈顿距离 + 弯头下界”估计排序，只真实重布前 `rotation_candidates` 个。
+**优化过程**：先按当前姿态重布；每一轮生成全部候选（串联拉直、单个对齐、换朝向），用 `routing.route_workers` 个进程并行评估（每个候选只重布相连的管、其余固定，用 `candidate_routing` 参数）；有改进的候选按改进量排序，挑出互不相干（移动对象与相关管都不重叠）的一批，合起来复核仍有改进就一次接受（否则只接受最好的一个）；没有改进或到时后，按最终姿态用完整参数联合重布一次取更好者。换朝向的候选先按“端口间曼哈顿距离 + 弯头下界”估计排序，只真实重布前 `rotation_candidates` 个。
 
 ## 8. 还没有的能力
 

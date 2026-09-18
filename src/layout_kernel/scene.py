@@ -14,6 +14,9 @@ settings（全部必填）：
   oblique_stub_mm：斜向端口在基线里找不到斜段时，沿法向伸出的短管长度
   rotation_candidates：每个可转节点每轮最多真实重布几种朝向（先按端口距离与弯头下界估计排序）
   lower_bound：{"enabled": bool, "max_expansions": 单管精确搜索的扩展上限}；打开时报告下界与差距（见 _attach_bound）
+  candidate_routing：评估候选移动时覆盖的求解参数（只需快速判断能否布下与代价，不必用出最终方案的完整强度），
+    例如 {"max_iters": 15, "stall_iters": 4, "max_expansions": 300000, "cleanup_max_expansions": 200000}；
+    基准与最终方案仍用 routing 里的完整参数
   pipe_rules：对方的直管规则，用来推算每根管的 rho / lead（见 _straight_rules）：
     {"trim_ratio": 弯头最多占相邻直管的比例, "radius_margin_mm": 有效弯曲半径须超过管半径的量,
      "port_margin_mm": 端口直颈之外的余量, "safety": 放大系数,
@@ -27,7 +30,8 @@ import time
 
 from . import constraints
 from . import routing as rt
-SETTINGS_REQUIRED = ["routing", "weights", "scale", "oblique_stub_mm", "pipe_rules", "rotation_candidates", "lower_bound"]
+SETTINGS_REQUIRED = ["routing", "weights", "scale", "oblique_stub_mm", "pipe_rules", "rotation_candidates", "lower_bound",
+                     "candidate_routing"]
 SERIAL_NETS = 8                                                 # 每个并行进程至少分到的管数
 RULES_REQUIRED = ["trim_ratio", "radius_margin_mm", "port_margin_mm", "safety", "rule_D_mm", "rule_R_mm"]
 
@@ -94,11 +98,11 @@ def _oblique_stub(port_w, normal_w, baseline_points, stub_mm):
             out = [0, 0, 0]
             out[i] = 1 if d[i] > 0 else -1
             return b, tuple(out), list(baseline_points[1])
-    end = tuple(round(P[i] + n[i] * stub_mm, 1) for i in range(3))
+    exact = [port_w[i] + normal_w[i] * stub_mm / 1000 for i in range(3)]   # 网页坐标下精确沿法向，不经取整
     i = max((0, 1), key=lambda k: abs(n[k]))
     out = [0, 0, 0]
     out[i] = 1 if n[i] > 0 else -1
-    return end, tuple(out), to_w(end)
+    return to_k(exact), tuple(out), exact
 
 
 def build_scene(inp, settings, fixed_ids=(), deltas=None):
@@ -399,12 +403,37 @@ def _attach_bound(out, final_inp, settings, deltas, log):
     return out
 
 
+_EV = {}
+
+
+def _ev_init(inp, light):
+    _EV.update(inp=inp, light=light)
+
+
+def _sub_input(inp, orient, inc, routes_w):
+    """候选评估用的输入：只放开 inc 中的管，范围内其余的管按当前路径固定为障碍。"""
+    return {**_posed(inp, orient),
+            "routes": [r if r["id"] in inc or r.get("fixed") else {**r, "points": routes_w[r["id"]], "fixed": True}
+                       for r in inp["routes"]]}
+
+
+def _ev_one(task):
+    """评估一个候选（可在工作进程中运行）。返回 (序号, 是否可行, 相关管的代价, 相关管的新路径)。"""
+    k, trial, trial_orient, inc, routes_w = task
+    r = _route_once(_sub_input(_EV["inp"], trial_orient, inc, routes_w), _EV["light"], (), trial)
+    if not r["ok"]:
+        return k, False, None, None
+    return k, True, _net_costs(r), {x["id"]: x["points"] for x in _to_web_routes(r["meta"], r["routes"])}
+
+
 def _optimize(inp, settings, log=None):
-    """布管 + 设备移动（局部或全局，范围由输入的 move 标记与 fixed 管决定）。只做平移，不改朝向。
+    """布管 + 设备移动 / 旋转 / 换向（局部或全局，范围由输入的 move 标记、候选朝向与 fixed 管决定）。
       1. 按当前姿态重布范围内全部管，得到基准；
-      2. 逐个试候选移动（串联拉直、单个对齐，见 _candidates）。每个候选只重布与被移动对象相连的管，
-         其余范围内的管按当前路径固定为障碍；这几根管的代价下降就接受，并以新姿态重新生成候选；
-      3. 没有改进或到达时间上限后，按最终姿态把范围内全部管再联合重布一次，取两者中更好的。
+      2. 每一轮生成候选（串联拉直、单个对齐、换朝向），并行评估：每个候选只重布与被移动对象相连的管，
+         其余范围内的管按当前路径固定为障碍，用 candidate_routing 的轻量参数；
+         取有改进的候选，按改进量从大到小挑出互不相干（移动对象与相关管都不重叠）的一批，
+         合在一起再评估一次确认仍有改进后一次接受（确认不通过则只接受最好的一个）；
+      3. 没有改进或到达时间上限后，按最终姿态用完整参数把范围内全部管联合重布一次，取两者中更好的。
     所有比较都用内核自己的指标（校验器口径）；最终是否采用由调用方的校验决定。"""
     log = log or (lambda _l: None)
     t0 = time.time()
@@ -419,53 +448,95 @@ def _optimize(inp, settings, log=None):
         f"可转节点 {len(rotatable)} 个，移动范围 ±{radius} m")
     if not first["ok"]:
         return _result(first, {}, [], 0, first["cost"], log), inp, {}
-    orient = {}
+    light = {**settings, "routing": {**settings["routing"], **settings["candidate_routing"], "route_workers": 1}}
     routes_w = {r["id"]: r["points"] for r in _to_web_routes(first["meta"], first["routes"])}
     cost = _net_costs(first)
-    deltas, tried, accepted, meta_now = {}, 0, [], first
-    improved = True
-    while improved and (movable and radius > 0 or rotatable) and time.time() - t0 < limit:
-        improved = False
-        now = _shifted(_posed(inp, orient), deltas)
-        info = meta_now["meta"] | {"sc": meta_now["sc"]}
-        cands = [(nm, mv, {}) for nm, mv in (_candidates(now, info, movable, radius) if movable and radius > 0 else [])]
-        cands += _rotation_candidates(now, info, rotatable, orient, deltas, settings, settings["rotation_candidates"])
-        for name, move, rot in cands:
-            if time.time() - t0 > limit:
+    orient, deltas, tried, accepted = {}, {}, 0, []
+    info = first["meta"] | {"sc": first["sc"]}
+    workers = int(settings["routing"]["route_workers"])
+    pool = None
+    try:
+        while (movable and radius > 0 or rotatable) and time.time() - t0 < limit:
+            now = _shifted(_posed(inp, orient), deltas)
+            cands = [(nm, mv, {}) for nm, mv in (_candidates(now, info, movable, radius) if movable and radius > 0 else [])]
+            cands += _rotation_candidates(now, info, rotatable, orient, deltas, settings, settings["rotation_candidates"])
+            tasks, meta = [], []
+            for name, move, rot in cands:
+                trial = dict(deltas)
+                for nid, d in move.items():
+                    acc = tuple(trial.get(nid, (0.0, 0.0, 0.0))[i] + d[i] for i in range(3))
+                    if any(abs(v) > radius + 1e-9 for v in acc):
+                        break
+                    trial[nid] = acc
+                else:
+                    moved = set(move)
+                    inc = frozenset(r["id"] for r in scope if owner[r["from"]["key"]] in moved or owner[r["to"]["key"]] in moved)
+                    if inc:
+                        tasks.append((len(tasks), trial, {**orient, **rot}, inc, routes_w))
+                        meta.append((name, moved, inc, move, rot))
+            if not tasks:
                 break
-            trial = dict(deltas)
-            trial_orient = {**orient, **rot}
-            for nid, d in move.items():
-                acc = tuple(trial.get(nid, (0.0, 0.0, 0.0))[i] + d[i] for i in range(3))
-                if any(abs(v) > radius + 1e-9 for v in acc):
-                    break
-                trial[nid] = acc
+            tried += len(tasks)
+            if workers > 1 and len(tasks) >= 4:
+                if pool is None:
+                    import multiprocessing as mp
+                    from concurrent.futures import ProcessPoolExecutor
+                    pool = ProcessPoolExecutor(workers, mp_context=mp.get_context("spawn"), initializer=_ev_init,
+                                               initargs=(inp, light))
+                results = list(pool.map(_ev_one, tasks))
             else:
-                moved = set(move)
-                inc = {r["id"] for r in scope if owner[r["from"]["key"]] in moved or owner[r["to"]["key"]] in moved}
-                if not inc:
+                _ev_init(inp, light)
+                results = [_ev_one(t_) for t_ in tasks]
+            good = []
+            for k, ok, new, rw in results:
+                if ok:
+                    inc = meta[k][2]
+                    gain = sum(cost[x] for x in inc) - sum(new[x] for x in inc)
+                    if gain > 1e-9:
+                        good.append((gain, k, new, rw))
+            if not good:
+                break
+            good.sort(key=lambda g: -g[0])
+            batch, used_n, used_p = [], set(), set()
+            for g in good:                                             # 互不相干的一批
+                name, moved, inc, move, rot = meta[g[1]]
+                if moved & used_n or inc & used_p:
                     continue
-                tried += 1
-                sub = {**_posed(inp, trial_orient),
-                       "routes": [r if r["id"] in inc or r.get("fixed") else {**r, "points": routes_w[r["id"]], "fixed": True}
-                                  for r in inp["routes"]]}
-                r = _route_once(sub, settings, (), trial)
-                if not r["ok"]:
+                batch.append(g); used_n |= moved; used_p |= inc
+            if len(batch) > 1:                                         # 合在一起再确认一次
+                trial, trial_orient, inc_all = dict(deltas), dict(orient), set()
+                for g in batch:
+                    _n, moved, inc, move, rot = meta[g[1]]
+                    t_trial = tasks[g[1]][1]
+                    for nid in moved:
+                        trial[nid] = t_trial[nid]
+                    trial_orient.update(rot)
+                    inc_all |= inc
+                _ev_init(inp, light)
+                _k, ok, new, rw = _ev_one((0, trial, trial_orient, frozenset(inc_all), routes_w))
+                gain = sum(cost[x] for x in inc_all) - sum(new[x] for x in inc_all) if ok else -math.inf
+                if ok and gain > batch[0][0] - 1e-9:
+                    deltas, orient = trial, trial_orient
+                    routes_w.update(rw); cost.update(new)
+                    for g in batch:
+                        accepted.append({"move": meta[g[1]][0], "gain": round(g[0], 4)})
+                    log(f"本轮并行接受 {len(batch)} 个候选，代价 -{gain:.3f}")
+                    info = _info(inp, settings, orient, deltas)
                     continue
-                new = _net_costs(r)
-                gain = sum(cost[x] for x in inc) - sum(new[x] for x in inc)
-                if gain > 1e-9:
-                    deltas, meta_now, orient = trial, r, trial_orient
-                    for x in _to_web_routes(r["meta"], r["routes"]):
-                        routes_w[x["id"]] = x["points"]
-                    cost.update(new)
-                    accepted.append({"move": name, "gain": round(gain, 4)})
-                    log(f"接受：{name}，代价 -{gain:.3f}")
-                    improved = True
-                    break                                              # 姿态变了，重新生成候选
+                batch = batch[:1]
+            gain, k, new, rw = batch[0]
+            name = meta[k][0]
+            deltas, orient = tasks[k][1], tasks[k][2]
+            routes_w.update(rw); cost.update(new)
+            accepted.append({"move": name, "gain": round(gain, 4)})
+            log(f"接受：{name}，代价 -{gain:.3f}")
+            info = _info(inp, settings, orient, deltas)
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=True, cancel_futures=True)
     total_inc = sum(cost.values())
     if accepted:
-        final = _route_once(_posed(inp, orient), settings, (), deltas)   # 最终姿态下联合重布全部范围内的管
+        final = _route_once(_posed(inp, orient), settings, (), deltas)   # 最终姿态下用完整参数联合重布
         if final["ok"] and final["cost"] <= total_inc + 1e-9:
             return _result(final, deltas, accepted, tried, first["cost"], log, time.time() - t0, orient), _posed(inp, orient), deltas
         log(f"联合重布未更好（{final['cost']:.3f} ≥ {total_inc:.3f}），采用逐步移动的结果")
@@ -474,6 +545,12 @@ def _optimize(inp, settings, log=None):
                            for k, v in routes_w.items()], cost=round(total_inc, 4), metrics=None)
         return out, _posed(inp, orient), deltas
     return _result(first, deltas, accepted, tried, first["cost"], log, time.time() - t0), inp, {}
+
+
+def _info(inp, settings, orient, deltas):
+    """当前姿态下的端口信息（生成候选用；不布管）。"""
+    sc, meta = build_scene(_posed(inp, orient), settings, (), deltas)
+    return meta | {"sc": sc}
 
 
 def _result(r, deltas, accepted, tried, base_cost, log, seconds=0.0, orient=None):
