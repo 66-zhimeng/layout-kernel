@@ -185,7 +185,7 @@ layout-kernel-scene < 请求.json > 结果.json        # 或 python -m layout_ke
 - 场景（米制、Y 向上）：
   - `nodes`：每个节点 `{id, move, box, orientations: [{angle, swap, ports: {key: {position, normal}}, box, spools}]}`。`orientations[0]` 是当前姿态，其余是允许换成的朝向（设备旋转、三通换向与换口），每个朝向的端口已按该朝向算好；`move` 表示可以平移。
   - `routes`：每根管 `{id, code, points, segments: [{r}], from: {key}, to: {key}, leadA, leadB, fixed, low}`，可选 `weight_length / weight_bends / weight_height_changes`（本管权重倍数）。
-  - `radius`（每轴移动范围，米）、`seconds`（时间上限）、可选 `lengthCap`（全部管道折线总长上限，米，含范围外的管；只接受不超过上限的改进，最终仍超出则 `ok=false` 并说明）。
+  - `radius`（每轴移动范围，米）、`seconds`（时间上限）。
   - 可选区域：`equipment_keepout`、`pipe_keepout`（三维盒 `[x0,y0,z0,x1,y1,z1]`，米；是否生效由同名约束决定）。
 - 设置：`routing`（求解参数 + `constraints`）、`weights`、`scale`、`oblique_stub_mm`、`pipe_rules`、
   `rotation_candidates`（每个可转节点每轮真实重布几种朝向）、`lower_bound`（`{enabled, max_expansions}`）、
@@ -195,9 +195,9 @@ layout-kernel-scene < 请求.json > 结果.json        # 或 python -m layout_ke
 
 - `offsets`：被移动节点的平移（米，Y 向上）；`orientations`：换了朝向的节点 → 输入 `orientations` 里的下标（调用方据此施加旋转 / 换口）。
 - `lower_bound`：`{valid, value, cost, gap, nets, unresolved, note}`。设备位置与朝向固定为最终方案时，各两端点管单独求精确最短路（不考虑其他待布管、放宽同管自身净距）之和；`gap = (cost − value) / cost` 是当前方案离这一下界的最大相对差距。它**不是**设备也能移动时的全局下界；多端点管网不给下界。
-- `pipe_rules` 用来把调用方自己的直管 / 弯头规则换算成内核的直管长度要求（见 `scene._straight_rules`），只在 `straight_lengths` 打开时生效。
+- `pipe_rules` 用来把调用方自己的直管 / 弯头规则换算成内核的直管长度要求（见 `scene._straight_rules`），只在 `straight_lengths` 打开时生效。端口在自身设备盒内时，盒内长度并入端口直颈再套用该规则（对方的弯头让位按整段直管的比例计，弯头圆弧须整段在盒外并与设备留 `pipe_equipment_clearance` 净距）。
 
-**优化过程**：先按当前姿态重布；每一轮生成全部候选（串联拉直、单个对齐、换朝向），用 `routing.route_workers` 个进程并行评估（每个候选只重布相连的管、其余固定，用 `candidate_routing` 参数）；有改进的候选按改进量排序，挑出互不相干（移动对象与相关管都不重叠）的一批，合起来复核仍有改进就一次接受（否则只接受最好的一个）；没有改进或到时后，按最终姿态用完整参数联合重布一次取更好者。换朝向的候选先按“端口间曼哈顿距离 + 弯头下界”估计排序，只真实重布前 `rotation_candidates` 个。
+**优化过程**：先按当前姿态重布；每一轮生成全部候选（串联拉直、单个对齐、换朝向），用 `routing.route_workers` 个进程并行评估（每个候选只重布相连的管、其余固定，用 `candidate_routing` 参数）；有改进的候选按改进量排序，挑出互不相干（移动对象与相关管都不重叠）的一批，合起来复核仍有改进就一次接受（否则只接受最好的一个）；没有改进后，按最终姿态用完整参数联合重布一次取更好者。`seconds` 限制候选评估：到时停止收集候选结果，只在已评估的里挑；到时后跳过最终联合重布。开头的整网重布（比较基准）与下界计算不在限时内。换朝向的候选先按“端口间曼哈顿距离 + 弯头下界”估计排序，只真实重布前 `rotation_candidates` 个。
 
 ## 8. 还没有的能力
 
