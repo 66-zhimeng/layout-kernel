@@ -95,6 +95,7 @@ class Scene:
         # “管件式”端口：端口外已有管件（如斜支口伸出段末端的 45° 弯），出入时按弯头计直管长度
         self.fitting_ports = {(did, pn) for did, d in devices.items() for pn in d.get("fitting_ports", ())}
         self.pose_cfg = None                                    # 姿态协商参数（scene 的 pose_negotiation 设置）
+        self.window = None                                      # 网格范围上限 (x0,y0,z0,x1,y1,z1)：候选评估只在局部窗口内布管
         self.lmin = scale["l_min_mm"]
         self.scale = scale                                      # A0 (mm²)、L0 (mm)、B0、C0、kappa
         D0 = rp["D_default_mm"]
@@ -158,6 +159,8 @@ class Grid:
             zhi = max(q[2] for q in pts) + mg
         zlo = min([D / 2] + port_z)
         lim = [(xs0, xs1), (ys0, ys1), (zlo, zhi)]
+        if sc.window is not None:                                       # 局部窗口：网格不超出窗口
+            lim = [(max(lim[a][0], sc.window[a]), min(lim[a][1], sc.window[a + 3])) for a in range(3)]
         cs = [set(), set(), set()]
         for a in (0, 1):
             lo, hi = lim[a]

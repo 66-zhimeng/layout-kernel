@@ -38,6 +38,7 @@ SETTINGS_REQUIRED = ["routing", "weights", "scale", "oblique_stub_mm", "pipe_rul
                      "candidate_routing", "pose_negotiation"]
 POSE_REQUIRED = ["enabled", "max_poses", "pres_bends", "hist_bends"]
 SERIAL_NETS = 8                                                 # 每个并行进程至少分到的管数
+REACH_M = 1.0                                                   # 局部窗口外的东西离窗口多远以上才去掉（米；须大于各类净距）
 RULES_REQUIRED = ["trim_ratio", "radius_margin_mm", "port_margin_mm", "safety", "rule_D_mm", "rule_R_mm"]
 
 
@@ -110,12 +111,13 @@ def _oblique_stub(port_w, normal_w, baseline_points, stub_mm):
     return to_k(exact), tuple(out), exact
 
 
-def build_scene(inp, settings, fixed_ids=(), deltas=None, ghosts=None, alts=None):
+def build_scene(inp, settings, fixed_ids=(), deltas=None, ghosts=None, alts=None, window=None):
     """网页优化输入 → routing.Scene。返回 (Scene, 元数据)。fixed_ids 中的管保持原路径，作为障碍。
     deltas = {节点 id: [dX, dY, dZ]}（网页坐标，米、Y 向上）：该节点的端口与包围盒整体平移。平移过的节点，
     其斜向端口不再沿用基线里的斜段，按法向重新伸出。
     姿态协商用：ghosts = {虚拟节点: 真实节点}（候选姿态，只提供端口，不是障碍，其端口可穿过真实节点当前的盒）；
-    alts = {端口 key: [(虚拟端口 key, 姿态序号), ...]}：接在该端口上的管两端可改接这些候选端口。"""
+    alts = {端口 key: [(虚拟端口 key, 姿态序号), ...]}：接在该端口上的管两端可改接这些候选端口。
+    window = {"min", "max"}（网页坐标）：网格只建在这个范围内（候选评估用，见 _crop）。"""
     ghosts, alts = ghosts or {}, alts or {}
     deltas = deltas or {}
     miss = [k for k in SETTINGS_REQUIRED if k not in settings]
@@ -223,6 +225,8 @@ def build_scene(inp, settings, fixed_ids=(), deltas=None, ghosts=None, alts=None
     pipe_keepout = [_box_k({"min": b[:3], "max": b[3:]}) for b in inp.get("pipe_keepout", [])]
     sc = rt.Scene(devices, nets, rp, settings["weights"], settings["scale"], fixed, spools, pipe_keepout)
     sc.equipment_keepout = [_box_k({"min": b[:3], "max": b[3:]}) for b in inp.get("equipment_keepout", [])]
+    if window is not None:
+        sc.window = _box_k(window)
     return sc, {"stubs": stubs, "port_w": port_w, "meta": meta}
 
 
@@ -278,8 +282,8 @@ def _moved_violations(sc, deltas):
     return out
 
 
-def _route_once(inp, settings, fixed_ids=(), deltas=None, log=None):
-    sc, meta = build_scene(inp, settings, fixed_ids, deltas)
+def _route_once(inp, settings, fixed_ids=(), deltas=None, log=None, window=None):
+    sc, meta = build_scene(inp, settings, fixed_ids, deltas, window=window)
     moved_viol = _moved_violations(sc, deltas)
     if moved_viol:                                                   # 移动本身不合法：不必布管
         return {"sc": sc, "meta": meta, "routes": {}, "viol": moved_viol, "met": {"per_net": {}}, "ok": False,
@@ -296,11 +300,11 @@ def _route_once(inp, settings, fixed_ids=(), deltas=None, log=None):
             "cost": cost if ok else math.inf, "history": history, "G": G}
 
 
-def _baseline(inp, settings):
+def _baseline(inp, settings, deltas=None):
     """把输入里范围内各管的现有路径换算成内核折线，用内核校验器检查并计算代价，作为比较基准（省去一次整网重布）。
     斜口的斜段不在内核折线里：沿用基线斜段时去掉它。任何一根不符合内核规则（非轴向、端口不符、违规）就返回
     (None, 原因)，由调用方改为整网重布。返回的结果带 "web"：原样的网页路径（不经取整）。"""
-    sc, meta = build_scene(inp, settings)
+    sc, meta = build_scene(inp, settings, (), deltas)
     owner = {k: n["id"] for n in inp["nodes"] for k in n["orientations"][0]["ports"]}
     routes, web = {}, {}
     for r in inp["routes"]:
@@ -519,10 +523,57 @@ def _sub_input(inp, orient, inc, routes_w):
                        for r in inp["routes"]]}
 
 
+def _window(inp, deltas, inc, routes_w, margin_m):
+    """候选评估的局部窗口（网页坐标）：要重布的管的现有路径、被移动节点（新姿态）的端口与盒，外扩 margin_m。"""
+    pts = [q for rid in inc for q in routes_w[rid]]
+    owner = {k: n["id"] for n in inp["nodes"] for k in n["orientations"][0]["ports"]}
+    for r in inp["routes"]:
+        if r["id"] in inc:
+            for end in ("from", "to"):
+                nid = owner[r[end]["key"]]
+                o = next(n for n in inp["nodes"] if n["id"] == nid)["orientations"][0]
+                d = deltas.get(nid, (0.0, 0.0, 0.0))
+                pts += [[p["position"][i] + d[i] for i in range(3)] for p in o["ports"].values()]
+                if o.get("box"):
+                    pts += [[o["box"][c][i] + d[i] for i in range(3)] for c in ("min", "max")]
+    return {"min": [min(q[i] for q in pts) - margin_m for i in range(3)],
+            "max": [max(q[i] for q in pts) + margin_m for i in range(3)]}
+
+
+def _crop(inp, window, reach_m, deltas):
+    """去掉与窗口无关的部分：包围盒外扩 reach_m 后不与窗口相交的固定管路，以及不连任何保留管、自身也不靠近窗口的节点。
+    新路径只在窗口内，被去掉的东西与它相距都超过 reach_m（大于管—管、管—设备净距与设备间距），不会影响可行性判断。"""
+    lo, hi = window["min"], window["max"]
+
+    def near(a, b):
+        return all(a[i] - reach_m <= hi[i] and b[i] + reach_m >= lo[i] for i in range(3))
+    routes = [r for r in inp["routes"] if not r.get("fixed")
+              or near([min(q[i] for q in r["points"]) for i in range(3)], [max(q[i] for q in r["points"]) for i in range(3)])]
+    keys = {r[e]["key"] for r in routes for e in ("from", "to")}
+    nodes = []
+    for n in inp["nodes"]:
+        o = n["orientations"][0]
+        d = deltas.get(n["id"], (0.0, 0.0, 0.0))                       # 按移动后的位置判断远近
+        ps = [p["position"] for p in o["ports"].values()]
+        if o.get("box"):
+            ps += [o["box"]["min"], o["box"]["max"]]
+        ps = [[q[i] + d[i] for i in range(3)] for q in ps]
+        if keys & set(o["ports"]) or (ps and near([min(q[i] for q in ps) for i in range(3)],
+                                                   [max(q[i] for q in ps) for i in range(3)])):
+            nodes.append(n)
+    return {**inp, "nodes": nodes, "routes": routes}
+
+
 def _ev_one(task):
-    """评估一个候选（可在工作进程中运行）。返回 (序号, 是否可行, 相关管的代价, 相关管的新路径)。"""
+    """评估一个候选（可在工作进程中运行）。返回 (序号, 是否可行, 相关管的代价, 相关管的新路径)。
+    只在相关管与被移动节点周围的局部窗口内布管（candidate_routing.window_mm）。"""
     k, trial, trial_orient, inc, routes_w = task
-    r = _route_once(_sub_input(_EV["inp"], trial_orient, inc, routes_w), _EV["light"], (), trial)
+    sub = _sub_input(_EV["inp"], trial_orient, inc, routes_w)
+    margin = _EV["light"]["candidate_routing"]["window_mm"] / 1000
+    win = _window(sub, trial, inc, routes_w, margin)
+    crop = _crop(sub, win, REACH_M, trial)
+    kept = {n["id"] for n in crop["nodes"]}
+    r = _route_once(crop, _EV["light"], (), {nid: d for nid, d in trial.items() if nid in kept}, window=win)
     if not r["ok"]:
         return k, False, None, None
     return k, True, _net_costs(r), {x["id"]: x["points"] for x in _to_web_routes(r["meta"], r["routes"])}
@@ -566,7 +617,11 @@ def _optimize(inp, settings, log=None):
             f"可移动节点 {len(movable)} 个，可转节点 {len(rotatable)} 个，移动范围 ±{radius} m")
     if not first["ok"]:
         return _result(first, {}, [], 0, first["cost"], log), inp, {}
-    light = {**settings, "routing": {**settings["routing"], **settings["candidate_routing"], "route_workers": 1}}
+    if "window_mm" not in settings["candidate_routing"]:
+        raise KeyError("candidate_routing 缺少 window_mm（候选评估的局部窗口外扩量，不设默认值）")
+    light = {**settings, "routing": {**settings["routing"],
+                                     **{k: v for k, v in settings["candidate_routing"].items() if k != "window_mm"},
+                                     "route_workers": 1}}
     routes_w = dict(first["web"]) if first.get("web") else         {r["id"]: r["points"] for r in _to_web_routes(first["meta"], first["routes"])}
     cost = _net_costs(first)
     orient, deltas, tried, accepted = {}, {}, 0, []
@@ -709,10 +764,18 @@ def _optimize(inp, settings, log=None):
             return _result(final, deltas, accepted, tried, first["cost"], log, time.time() - t0, orient), _posed(inp, orient), deltas
         log(f"联合重布未更好（{final['cost']:.3f} ≥ {total_inc:.3f}），采用逐步移动的结果")
     if accepted:
-        out = _result(first, deltas, accepted, tried, first["cost"], log, time.time() - t0, orient)
-        out.update(routes=[{"id": k, "code": next(r.get("code") for r in scope if r["id"] == k), "points": v}
-                           for k, v in routes_w.items()], cost=round(total_inc, 4), metrics=None)
-        return out, _posed(inp, orient), deltas
+        # 逐步移动的结果是各候选分别在局部窗口里验证的：在全场景里再完整校验一次（约 1 s）
+        posed = _posed(inp, orient)
+        chk, why = _baseline({**posed, "routes": [{**r, "points": routes_w.get(r["id"], r["points"])} for r in posed["routes"]]},
+                             settings, deltas)
+        if chk is not None:
+            out = _result(chk, deltas, accepted, tried, first["cost"], log, time.time() - t0, orient)
+            return out, posed, deltas
+        log(f"逐步移动的结果全场景校验未通过（{why[0]}），按最终姿态联合重布")
+        final = _route_once(posed, settings, (), deltas)
+        if final["ok"]:
+            return _result(final, deltas, accepted, tried, first["cost"], log, time.time() - t0, orient), posed, deltas
+        log("联合重布也未通过，保留原布局")
     return _result(first, deltas, accepted, tried, first["cost"], log, time.time() - t0), inp, {}
 
 
