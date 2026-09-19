@@ -10,12 +10,24 @@
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11%2B-3776AB.svg?logo=python&logoColor=white)](pyproject.toml)
-[![Tests](https://img.shields.io/badge/tests-62%20passed-brightgreen.svg)](tests)
+[![Tests](https://img.shields.io/badge/tests-66%20passed-brightgreen.svg)](tests)
+[![Docs](https://img.shields.io/badge/docs-操作说明-orange.svg)](docs/guide.md)
 [![Numba](https://img.shields.io/badge/A*-numba%20compiled-00A3E0.svg)](src/layout_kernel/astar_fast.py)
 
 </div>
 
 ---
+
+## 文档
+
+| 文档 | 内容 |
+|---|---|
+| 📘 [**操作说明**](docs/guide.md)（[English](docs/guide.en.md)） | 全部开放接口：三个入口的调用方式、请求与结果的每个字段、错误与退出码、从 Python / Node / 浏览器调用、施加结果、调参、排错、接入实例 |
+| 📐 [契约](docs/contract.md) | 任务书与方案的字段级定义、目标函数、约束注册表、求解参数 |
+| 🧮 [数学模型](docs/model.md) | 模型推导与定义 |
+| ▶️ [场景示例](examples/scene/) | 可直接运行的请求 `request.json` 与脚本 `run_scene.py`（移动传感器，弯头 4 → 2） |
+| ▶️ [布管示例](examples/minimal_routing.py) | 直接调用布管器与校验器，每个参数都有注释 |
+| ▶️ [任务书示例](examples/case_small_plant.json) | 摆放 + 布管的完整任务书 |
 
 ## 为什么用它
 
@@ -79,10 +91,11 @@ layout-kernel examples/case_small_plant.json -o 方案.json
 <summary><b>2. 三维场景：接入已有项目</b></summary>
 
 ```bash
-layout-kernel-scene < 请求.json > 结果.json
+layout-kernel-scene < examples/scene/request.json > result.json
+python examples/scene/run_scene.py            # 同一个示例的 Python 写法
 ```
 
-请求里是节点（包围盒、各候选朝向下的端口）、管路（端点、现有折点、外径、直颈），以及设置（约束、权重、时间上限等）。结果里是新的管路折点、设备平移 `offsets`、换了朝向的节点 `orientations`、下界与差距。完整说明见 [docs/contract.md 第 7 节](docs/contract.md)。
+请求里是节点（包围盒、各候选姿态下的端口）、管路（端点、现有折点、外径、直颈）和设置（约束、权重、时间上限等）。结果里是新的管路折点、设备平移 `offsets`、换了姿态的节点 `orientations`，以及下界与差距。每个字段的说明和从其他语言调用的写法见 [操作说明第 4 节](docs/guide.md#4-入口-a三维场景接口接入已有项目)。
 </details>
 
 <details>
@@ -125,9 +138,9 @@ viol, metrics = rt.check_routes(sc, routes)
 
 | 场景 | 结果 | 用时 |
 |---|---|---|
-| 全局优化 | 弯头 454 → 约 340–370，管长 2173 → 约 2090 m | 60–300 s（可设） |
-| 离下界的差距 | 1.4%–2.7% | 下界约 5 s |
-| 局部（3 个传感器） | 弯头 464 → 458，差距 0% | 约 8 s |
+| 全局优化，设 120 s | 弯头 454 → 330，管长 2173 → 2089 m，离下界 1.2% | 约 130 s |
+| 全局优化，设 60 s | 弯头 454 → 380，离下界 1.9% | 约 70 s |
+| 局部（3 个传感器） | 弯头 464 → 458，差距 0% | 约 7 s |
 
 > 差距是在最终设备位置和朝向下计算的，各管单独求最短路后相加。它不是设备也能移动时的全局下界。并行协商每次结果略有不同。
 
@@ -147,7 +160,7 @@ viol, metrics = rt.check_routes(sc, routes)
 ## 测试
 
 ```bash
-.venv/Scripts/python -m pytest -q        # 62 个
+.venv/Scripts/python -m pytest -q        # 66 个
 ```
 
 ## 已知限制

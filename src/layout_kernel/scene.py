@@ -477,6 +477,9 @@ def _net_costs(r):
 
 
 def optimize_scene(inp, settings, log=None):
+    """场景优化的对外入口：布管 + 设备平移 / 旋转 / 换口，附下界。输入、设置、结果见 docs/guide.md 第 4 节。
+    log(line) 接收过程日志（可不给）。"""
+    log = log or (lambda _l: None)
     out, final_inp, deltas = _optimize(inp, settings, log)
     return _attach_bound(out, final_inp, settings, deltas, log)
 

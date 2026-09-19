@@ -1,0 +1,369 @@
+{
+ "input": {
+  "nodes": [
+   {
+    "id": "pump",
+    "move": false,
+    "orientations": [
+     {
+      "angle": 0,
+      "swap": false,
+      "box": {
+       "min": [
+        0,
+        0,
+        0
+       ],
+       "max": [
+        1.2,
+        1.0,
+        0.8
+       ]
+      },
+      "ports": {
+       "pump/out": {
+        "position": [
+         1.2,
+         0.5,
+         0.4
+        ],
+        "normal": [
+         1,
+         0,
+         0
+        ]
+       }
+      },
+      "spools": []
+     }
+    ]
+   },
+   {
+    "id": "sensor",
+    "move": true,
+    "orientations": [
+     {
+      "angle": 0,
+      "swap": false,
+      "box": {
+       "min": [
+        3.0,
+        0.4,
+        0.6
+       ],
+       "max": [
+        3.4,
+        0.6,
+        0.8
+       ]
+      },
+      "ports": {
+       "sensor/a": {
+        "position": [
+         3.0,
+         0.5,
+         0.7
+        ],
+        "normal": [
+         -1,
+         0,
+         0
+        ]
+       },
+       "sensor/b": {
+        "position": [
+         3.4,
+         0.5,
+         0.7
+        ],
+        "normal": [
+         1,
+         0,
+         0
+        ]
+       }
+      },
+      "spools": []
+     },
+     {
+      "angle": 3.141592653589793,
+      "swap": false,
+      "box": {
+       "min": [
+        3.0,
+        0.4,
+        0.6
+       ],
+       "max": [
+        3.4,
+        0.6,
+        0.8
+       ]
+      },
+      "ports": {
+       "sensor/a": {
+        "position": [
+         3.4,
+         0.5,
+         0.7
+        ],
+        "normal": [
+         1,
+         0,
+         0
+        ]
+       },
+       "sensor/b": {
+        "position": [
+         3.0,
+         0.5,
+         0.7
+        ],
+        "normal": [
+         -1,
+         0,
+         0
+        ]
+       }
+      },
+      "spools": []
+     }
+    ]
+   },
+   {
+    "id": "chiller",
+    "move": false,
+    "orientations": [
+     {
+      "angle": 0,
+      "swap": false,
+      "box": {
+       "min": [
+        6.0,
+        0,
+        0.5
+       ],
+       "max": [
+        8.0,
+        2.0,
+        2.5
+       ]
+      },
+      "ports": {
+       "chiller/in": {
+        "position": [
+         6.0,
+         0.5,
+         1.0
+        ],
+        "normal": [
+         -1,
+         0,
+         0
+        ]
+       }
+      },
+      "spools": []
+     }
+    ]
+   }
+  ],
+  "routes": [
+   {
+    "id": "pipe_1",
+    "code": "供水 1",
+    "from": {
+     "key": "pump/out"
+    },
+    "to": {
+     "key": "sensor/a"
+    },
+    "points": [
+     [
+      1.2,
+      0.5,
+      0.4
+     ],
+     [
+      2.0,
+      0.5,
+      0.4
+     ],
+     [
+      2.0,
+      0.5,
+      0.7
+     ],
+     [
+      3.0,
+      0.5,
+      0.7
+     ]
+    ],
+    "segments": [
+     {
+      "r": 0.05
+     }
+    ],
+    "leadA": 0,
+    "leadB": 0,
+    "fixed": false,
+    "low": false
+   },
+   {
+    "id": "pipe_2",
+    "code": "供水 2",
+    "from": {
+     "key": "sensor/b"
+    },
+    "to": {
+     "key": "chiller/in"
+    },
+    "points": [
+     [
+      3.4,
+      0.5,
+      0.7
+     ],
+     [
+      4.6,
+      0.5,
+      0.7
+     ],
+     [
+      4.6,
+      0.5,
+      1.0
+     ],
+     [
+      6.0,
+      0.5,
+      1.0
+     ]
+    ],
+    "segments": [
+     {
+      "r": 0.05
+     }
+    ],
+    "leadA": 0,
+    "leadB": 0,
+    "fixed": false,
+    "low": false
+   }
+  ],
+  "radius": 1.0,
+  "seconds": 30,
+  "equipment_keepout": [],
+  "pipe_keepout": []
+ },
+ "settings": {
+  "routing": {
+   "D_default_mm": 220,
+   "c_rho": 1.5,
+   "eps_z_mm": 1,
+   "pitch_mm": 500,
+   "margin_mm": 2000,
+   "max_iters": 60,
+   "pres_fac_init": 0.5,
+   "pres_fac_mult": 1.6,
+   "hist_fac": 0.5,
+   "max_expansions": 1000000,
+   "astar_weight": 1.5,
+   "route_workers": 1,
+   "stall_iters": 12,
+   "cleanup_trigger_nets": 4,
+   "cleanup_max_expansions": 2000000,
+   "freeze_after_exhausted": 2,
+   "port_side_lines": false,
+   "constraints": {
+    "pipe_pipe_clearance": {
+     "enabled": true,
+     "gap_mm": 25
+    },
+    "pipe_equipment_clearance": {
+     "enabled": true,
+     "gap_mm": 25
+    },
+    "self_clearance": {
+     "enabled": true,
+     "skip_along_mm": 550
+    },
+    "height_change_limit": {
+     "enabled": false
+    },
+    "ceiling": {
+     "enabled": true,
+     "z_max_mm": 10000
+    },
+    "service_zones": {
+     "enabled": false
+    },
+    "straight_lengths": {
+     "enabled": true
+    },
+    "low_pipes": {
+     "enabled": true,
+     "zc_max_mm": 3199.9
+    },
+    "junction_merge_exemption": {
+     "enabled": true
+    },
+    "internal_spools": {
+     "enabled": true
+    },
+    "equipment_spacing": {
+     "enabled": true,
+     "gap_mm": 120
+    },
+    "equipment_keepout": {
+     "enabled": false
+    },
+    "pipe_keepout": {
+     "enabled": false
+    }
+   }
+  },
+  "weights": {
+   "area": 0,
+   "length": 1,
+   "bends": 3,
+   "height_changes": 1
+  },
+  "scale": {
+   "A0": 1000000,
+   "L0": 1000,
+   "B0": 1,
+   "C0": 1,
+   "kappa": 1000,
+   "l_min_mm": 0
+  },
+  "oblique_stub_mm": 600,
+  "pipe_rules": {
+   "trim_ratio": 0.42,
+   "radius_margin_mm": 10,
+   "port_margin_mm": 15,
+   "safety": 1,
+   "rule_D_mm": 220,
+   "rule_R_mm": 380
+  },
+  "rotation_candidates": 3,
+  "lower_bound": {
+   "enabled": true,
+   "max_expansions": 2000000
+  },
+  "candidate_routing": {
+   "max_iters": 15,
+   "stall_iters": 4,
+   "max_expansions": 300000,
+   "cleanup_max_expansions": 200000,
+   "window_mm": 3000
+  },
+  "pose_negotiation": {
+   "enabled": false,
+   "max_poses": 3,
+   "pres_bends": 1.0,
+   "hist_bends": 0.5
+  }
+ }
+}

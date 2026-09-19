@@ -10,12 +10,24 @@ Equipment placement · 3D orthogonal pipe routing · negotiated congestion resol
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.11%2B-3776AB.svg?logo=python&logoColor=white)](pyproject.toml)
-[![Tests](https://img.shields.io/badge/tests-62%20passed-brightgreen.svg)](tests)
+[![Tests](https://img.shields.io/badge/tests-66%20passed-brightgreen.svg)](tests)
+[![Docs](https://img.shields.io/badge/docs-user%20guide-orange.svg)](docs/guide.en.md)
 [![Numba](https://img.shields.io/badge/A*-numba%20compiled-00A3E0.svg)](src/layout_kernel/astar_fast.py)
 
 </div>
 
 ---
+
+## Documentation
+
+| Document | Contents |
+|---|---|
+| 📘 [**User guide**](docs/guide.en.md) ([简体中文](docs/guide.md)) | Every public interface: the three entry points, each request and result field, errors and exit codes, calling from Python / Node / a browser, applying results, tuning, troubleshooting, and a case study |
+| 📐 [Contract](docs/contract.md) (Chinese) | Field-level definition of the task file and result, the objective, the constraint registry, solver parameters |
+| 🧮 [Model](docs/model.md) (Chinese) | Derivation of the mathematical model |
+| ▶️ [Scene example](examples/scene/) | A runnable `request.json` plus `run_scene.py` (moving a sensor cuts bends from 4 to 2) |
+| ▶️ [Routing example](examples/minimal_routing.py) | Calls the router and validator directly, with every parameter commented |
+| ▶️ [Task-file example](examples/case_small_plant.json) | A complete place-and-route task file |
 
 ## Why
 
@@ -79,10 +91,11 @@ Set `task.mode` to `place_and_route` (find equipment positions and pipes) or `ro
 <summary><b>2. 3D scene: integrate with an existing project</b></summary>
 
 ```bash
-layout-kernel-scene < request.json > result.json
+layout-kernel-scene < examples/scene/request.json > result.json
+python examples/scene/run_scene.py            # the same example from Python
 ```
 
-The request holds nodes (bounding boxes, ports for each candidate orientation), routes (ends, current bends, outer diameter, straight necks) and settings (constraints, weights, time limit, and so on). The result holds new route polylines, equipment `offsets`, re-oriented nodes in `orientations`, and the lower bound and gap. See [docs/contract.md §7](docs/contract.md).
+The request holds nodes (bounding boxes, ports for each candidate pose), routes (ends, current bends, outer diameter, straight necks) and settings (constraints, weights, time limit, and so on). The result holds new route polylines, equipment `offsets`, re-oriented nodes in `orientations`, and the lower bound and gap. Every field, and how to call the kernel from other languages, is in [user guide §4](docs/guide.en.md#4-entry-a-3d-scene-interface).
 </details>
 
 <details>
@@ -125,9 +138,9 @@ In a Three.js piping-network web app (230 pipes, 183 nodes), every kernel result
 
 | Scenario | Result | Time |
 |---|---|---|
-| Global optimization | bends 454 → ~340–370, length 2173 → ~2090 m | 60–300 s (configurable) |
-| Gap to lower bound | 1.4%–2.7% | bound ≈ 5 s |
-| Local (3 sensors) | bends 464 → 458, gap 0% | ≈ 8 s |
+| Global, `seconds` = 120 | bends 454 → 330, length 2173 → 2089 m, 1.2% from the lower bound | ≈ 130 s |
+| Global, `seconds` = 60 | bends 454 → 380, 1.9% from the lower bound | ≈ 70 s |
+| Local (3 sensors) | bends 464 → 458, gap 0% | ≈ 7 s |
 
 > The gap is computed at the final equipment positions and orientations: each pipe's shortest route on its own, summed. It is not a global bound over equipment that can still move. Parallel negotiation varies slightly from run to run.
 
@@ -147,7 +160,7 @@ In a Three.js piping-network web app (230 pipes, 183 nodes), every kernel result
 ## Tests
 
 ```bash
-.venv/Scripts/python -m pytest -q        # 62 tests
+.venv/Scripts/python -m pytest -q        # 66 tests
 ```
 
 ## Limitations
