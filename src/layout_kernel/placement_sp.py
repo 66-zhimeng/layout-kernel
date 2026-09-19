@@ -1,4 +1,4 @@
-"""块级摆放：序列对搜索 + LP 定位。问题定义、评分与 placement_cpsat.py 相同（按 v2 下界评分）。
+"""块级摆放：序列对搜索 + LP 定位。问题定义、评分与 placement_cpsat.py 相同（按管道下界评分，见 docs/model.md 第 5.4 节）。
 
 解的表示：(Γ⁺, Γ⁻, 每块旋转, 每个复制组的内部排法, 两端点管网的“直连”标记)
   - i 在 j 左 ⇔ 两个序列中 i 都在 j 前；i 在 j 下 ⇔ Γ⁺ 中 i 在 j 后、Γ⁻ 中 i 在 j 前
@@ -14,9 +14,9 @@
        长度 = 曼哈顿距离；否则长度 ≥ max(曼哈顿距离, 2ℓ_min + 伸出点曼哈顿距离)。
      多端点管网：默认为伸出点坐标跨度（max − min）；trunk=True 时改用“主干 + 分支”估计
     （主干沿一条直线，长度 = 主干轴跨度 + Σ 各端点到主干的垂距；恒 ≥ 跨度估计，仍是有效下界）。
-  4. 以 placement_cpsat.validate(..., lb="v2") 计算最终 J；所有比较以校验器为准。
+  4. 以 placement_cpsat.validate(..., lb="v2") 计算最终 J（v2 = 第 5.4 节的下界定义）；所有比较以校验器为准。
 
-检修区处理（交接文档 4.3 第 2 条方式 (a)）：
+检修区处理：
   对每对 (i, j)，按序列对给出的方向加间距 max(块+净距, i 检修区伸出量, j 检修区伸出量)。
   这是充分条件；检修区在块宽度范围之外伸出、且在另一轴上错开的布局会被排除（启发式限制）。
 
@@ -28,7 +28,7 @@
     用于 LP 与快速下界（下界严重低估的管网，例如多端点总管，被拉得更近）。
   - 进程间共享、重新加热、最终返回的“最好解”都改按 J_route 比较。
 
-运行：.venv/Scripts/python placement_sp.py [总秒数，默认 60] [进程数，默认 12] [种子，默认 0]
+由 api.solve 调用（run(...)）；方法说明见 docs/model.md 第 5.3 节。
 """
 import math
 import multiprocessing as mp
@@ -106,7 +106,7 @@ class Problem:
 
 
 def access_rects_factory(P, access):
-    """端口接入区（主文档 12.3 的必要条件）：管道离开端口须先直行 ≥ ℓ_min。
+    """端口接入区（docs/model.md 第 3.2 节的必要条件）：管道离开端口须先直行 ≥ ℓ_min。
     返回函数 pose → (raw_rects, pipe_rects)，局部坐标 (x0, y0, x1, y1)，网格单位：
       raw_rects  管段盒按 δ_ep 膨胀，不得与其他块重叠
       pipe_rects 管段盒本身（宽 D），不得与其他块的检修区重叠"""
@@ -223,7 +223,7 @@ def skeleton(pr, st):
                         g = max(g, ab[i][1] - zb[j][0])
                     if zb[i] and ab[j]:
                         g = max(g, zb[i][1] - ab[j][0])
-                if pr.margins:                              # 出管留空：两侧叠加；留空不压对方检修区
+                if pr.margins:                              # 出管留空：两侧叠加；留空不压另一块的检修区
                     g = max(g, ps[i]["W"] + mg[i][1] + mg[j][0])
                     if zb_m[j]:
                         g = max(g, ps[i]["W"] + mg[i][1] - zb_m[j][0])

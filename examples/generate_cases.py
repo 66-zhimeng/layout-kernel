@@ -70,7 +70,7 @@ PARAMS = {
     "grid_mm": 100, "delta_ee_mm": 800, "l_min_mm": 300, "kappa": 2,
     "service_zones_inside_footprint": False,
     "weights": {"area": 1.0, "length": 1.0, "bends": 0.3, "height_changes": 0.3},
-    "routing": {                                 # 布管参数（主文档 12.3、12.4、12.6）；数值为合成算例自拟，待用户确认
+    "routing": {                                 # 布管参数（docs/model.md 第 3 节）；数值为合成算例自拟
         "D_default_mm": 200,                     # 默认管径（本算例所有管网、端口同径，不产生变径段）
         "c_rho": 1.5,                            # 弯曲半径 ρ = c_ρ·D
         "eps_z_mm": 1,                           # 高度容差（校验用）
@@ -102,7 +102,7 @@ PARAMS = {
         "max_expansions": 500000,                # 单次 A* 最多扩展状态数
         "astar_weight": 1.5,                     # 启发式放大系数（1 = 单管最优；>1 更快但不保证最优）
         "route_workers": 12,                     # 每轮内并行布管的进程数（1 = 串行）
-        "coarse_cell_mm": 300,                   # 粗网格布管：平面格子尺寸（校准见 布管原型/粗网格校准.py）
+        "coarse_cell_mm": 300,                   # 粗网格布管：平面格子尺寸
         "coarse_iters": 15,                      # 粗网格布管：协商轮数上限
         "coarse_vertical_penalty_mm": 1000,      # 粗网格布管：每层竖向移动额外代价（粗略代表高度变化）
         "guide_every_s": 5,                      # 布管引导摆放：每个退火进程每隔几秒做一次粗网格布管

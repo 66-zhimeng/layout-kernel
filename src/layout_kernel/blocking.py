@@ -1,6 +1,6 @@
-"""分块：设备级算例 → 块级算例（供 摆放原型/placement_*.py 使用）+ 按连接关系聚簇。
+"""分块：设备级算例 → 块级算例（供 placement_sp / placement_cpsat 使用）+ 按连接关系聚簇。
 
-对应主文档第 8 节与 4.2 节，分两类，不能混淆：
+见 docs/model.md 第 5.2 节。分两类，不能混淆：
   1. 标准模块（刚性）：内部相对位置固定，整体平移 / 旋转。来源：
        a. 输入 JSON 的 "modules" 标注（优先）；
        b. 自动识别的候选（auto_module_policy = "accept" 时使用，"report_only" 时只报告）。
@@ -413,7 +413,7 @@ def build_block_instance(inst, modules):
             continue
         nets.append({"id": n["id"], "terminals": terms})
     params = {k: P[k] for k in REQUIRED_PARAMS}
-    data = {"说明": "由 分块原型/blocking.py 从设备级算例生成", "params": params, "templates": templates,
+    data = {"说明": "由 layout_kernel.blocking 从设备级算例生成", "params": params, "templates": templates,
             "blocks": [{k: v for k, v in b.items() if k != "members" and v is not None} for b in blocks],
             "nets": nets}
     stats = {"devices": len(inst["devs"]), "blocks": len(blocks), "module_blocks": sum(1 for b in blocks if "template" in b),

@@ -74,7 +74,7 @@
  "iterations": 1,
  "grid_nodes": 15939,
  "timing": {
-  "route_s": 0.3
+  "route_s": 0.2
  },
  "lower_bound": {
   "valid": true,

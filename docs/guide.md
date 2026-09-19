@@ -5,7 +5,7 @@
 本文说明 layout-kernel 对外开放的全部接口：怎么调用、传什么、返回什么、出错时怎么表现，并配有可运行的示例。
 
 - 任务书的完整字段、目标函数、约束注册表：见 [contract.md](contract.md)。
-- 数学模型推导：见 [model.md](model.md)。
+- 数学模型与求解方法：见 [model.md](model.md)。
 
 **目录**
 
@@ -18,7 +18,6 @@
 7. [约束配置](#7-约束配置)
 8. [调参](#8-调参)
 9. [出错与排查](#9-出错与排查)
-10. [接入实例：拆件做网页](#10-接入实例拆件做网页)
 
 ---
 
@@ -43,7 +42,7 @@ python -m venv .venv
 
 安装后得到两个命令：`layout-kernel`（任务书）、`layout-kernel-scene`（场景）。
 
-**调用方不一定要装内核的依赖。** 另一个项目可以只记住内核虚拟环境里 Python 的路径，以子进程方式调用 `python -m layout_kernel.scene_cli`，自己的环境不需要 numpy、numba 这些依赖。拆件做网页就是这样接入的，见第 10 节。
+**调用方不一定要装内核的依赖。** 另一个项目可以只记住内核虚拟环境里 Python 的路径，以子进程方式调用 `python -m layout_kernel.scene_cli`，自己的环境不需要 numpy、numba 这些依赖（写法见 4.6 节）。
 
 开发时这样安装：
 
@@ -60,7 +59,7 @@ python -m venv .venv && .venv/Scripts/python -m pip install -e ".[test,plot]"
 3. **结果以独立校验器为准。** 返回的 `ok`、`violations`、指标都来自只看几何的校验器 `routing.check_routes`，不依赖求解器内部数据。
 4. **失败是正常返回。** 布不通、有违规时返回 `ok: false` 和违规原文；只有输入本身不合法才抛异常（命令行则返回错误 JSON 和非 0 退出码）。
 5. **启发式，附下界。** 方案是可行的较优解，不是最优性证明；`lower_bound.gap` 说明离下界最多差多少（4.3 节）。
-6. **单位**：场景接口使用米，**Y 轴向上**（与 Three.js 一致）；任务书和 Python 模块使用毫米，**Z 轴向上**。场景接口在内部自动换算。
+6. **单位**：场景接口使用米，**Y 轴向上**（常见三维引擎的约定）；任务书和 Python 模块使用毫米，**Z 轴向上**。场景接口在内部自动换算。
 7. **多进程**：`route_workers > 1` 或任务书摆放会用多进程（spawn 方式）。在 Python 里直接调用时，入口代码必须放在 `if __name__ == "__main__":` 之下。
 
 ---
@@ -157,13 +156,13 @@ python examples/scene/run_scene.py
 | `weights` | `{area, length, bends, height_changes}`，目标里各项的权重 |
 | `scale` | `{A0, L0, B0, C0, kappa, l_min_mm}`，归一化尺度（占地 mm²、管长 mm、弯头数、高度变化数）、长宽比上限、最小直管 |
 | `oblique_stub_mm` | 斜支口在基线里找不到斜段时，沿法向伸出的斜管长度 |
-| `pipe_rules` | 调用方的直管和弯头规则，内核换算成直管长度要求：`{trim_ratio, radius_margin_mm, port_margin_mm, safety, rule_D_mm, rule_R_mm}`，见 contract.md 第 7 节 |
+| `pipe_rules` | 调用方的直管和弯头规则，内核换算成直管长度要求：`{trim_ratio, radius_margin_mm, port_margin_mm, safety, rule_D_mm, rule_R_mm}`，见 [model.md 第 3.2 节](model.md#32-管路几何) |
 | `rotation_candidates` | 每个可转节点每轮最多真实重布几个朝向（先按估计排序） |
 | `lower_bound` | `{enabled, max_expansions}`。打开时报告下界和差距 |
 | `candidate_routing` | 评估候选时覆盖 `routing` 的轻量参数，如 `{max_iters, stall_iters, max_expansions, cleanup_max_expansions}`，另外**必须有 `window_mm`**：候选只在相关管和被移动节点周围、外扩这么多的窗口内布管 |
 | `pose_negotiation` | `{enabled, max_poses, pres_bends, hist_bends}`，姿态协商（4.4 节）；`enabled: false` 时其余三项仍要写 |
 
-与拆件做网页校验口径一致的完整设置，可以直接复制 [examples/scene/request.json](../examples/scene/request.json) 里的 `settings`。
+一套完整可用的设置，可以直接复制 [examples/scene/request.json](../examples/scene/request.json) 里的 `settings` 再按需修改。
 
 ### 4.3 结果
 
@@ -200,7 +199,7 @@ python examples/scene/run_scene.py
 ### 4.4 优化过程
 
 1. **基准**：把输入里的现有路径用内核校验器检查。通过就直接作为基准；只有少数管不符合时，只重布这几根；不符合的太多则整网重布。
-2. **姿态协商**（可选，`pose_negotiation.enabled`）：把每个可动节点的候选姿态并入协商布线，一次选定各节点姿态（原理见 contract.md 第 7 节）。
+2. **姿态协商**（可选，`pose_negotiation.enabled`）：把每个可动节点的候选姿态并入协商布线，一次选定各节点姿态（原理见 [model.md 第 5.11 节](model.md#511-姿态协商)）。
 3. **逐轮候选改进**：
    - 候选有三类：串联拉直（相连的在线设备整串平移到一条线上）、单个对齐、换朝向；
    - 用 `route_workers` 个进程并行评估，每个候选只在局部窗口内重布相关的管；
@@ -247,7 +246,7 @@ const out = JSON.parse(p.stdout.toString('utf8'));
 if (p.status !== 0) throw new Error(out.error);
 ```
 
-**浏览器**：不能直接起进程。需要由本机服务转发，例如拆件做网页的 `POST /api/layout-kernel`（第 10 节）。
+**浏览器**：不能直接起进程。需要由本机的一个小服务接收请求（例如 `POST /api/layout`），用上面的子进程写法转发给内核，再把结果返回浏览器。
 
 ---
 
@@ -346,7 +345,7 @@ viol, metrics = rt.check_routes(sc, routes)
 | `optimize_scene(inp, settings, log=None)` | 入口 A 的函数形式 |
 | `route_scene(inp, settings, fixed_ids=(), log=None)` | 设备不动，只重布 |
 | `build_scene(inp, settings, fixed_ids=(), deltas=None)` | 场景输入转换成 `(routing.Scene, 元数据)`，可以接着用 6.1 的函数 |
-| `to_k(p)` / `to_w(p)` | 网页坐标（米、Y 向上）与内核坐标（毫米、Z 向上）互相换算 |
+| `to_k(p)` / `to_w(p)` | 场景坐标（米、Y 向上）与内核坐标（毫米、Z 向上）互相换算 |
 
 ---
 
@@ -402,27 +401,3 @@ viol, metrics = rt.check_routes(sc, routes)
 | `端口超出布管范围` | 候选把端口移到网格之外（例如高过顶棚） | 正常现象，这个候选会被判为不可行 |
 | Windows 上多进程报错或卡住 | 调用代码没放在 `if __name__ == "__main__":` 之下 | 放进去；命令行入口不受影响 |
 | 调用方校验不通过，但内核 `ok: true` | 两边口径有差异 | 以调用方为准。把请求和结果存下来，对比违规的管和那段几何；需要时调整 `pipe_rules`、净距参数 |
-
-## 10. 接入实例：拆件做网页
-
-一个 Three.js 系统管网页面（230 根管、183 个节点）。浏览器通过本机服务调用内核，内核给出的结果还要再通过页面自己的实体校验，才会作为候选方案交给用户选择：
-
-```mermaid
-sequenceDiagram
-    participant B as 浏览器（Web Worker）
-    participant S as 本机服务 serve.py
-    participant K as layout-kernel（子进程）
-    B->>S: POST /api/layout-kernel {input}
-    S->>S: 读取 data/layout-kernel.json（settings、单管权重、禁区）
-    S->>K: python -m layout_kernel.scene_cli（stdin 请求）
-    K-->>S: stdout 结果 JSON
-    S-->>B: 结果
-    B->>B: 施加 orientations / offsets、替换管路，页面实体校验，优于当前才给用户
-```
-
-| 部分 | 文件（在拆件做网页仓库里） | 作用 |
-|---|---|---|
-| 配置 | `data/layout-kernel.json` | 内核 Python 路径、超时、完整 `settings`、单管权重（按管道编号）、禁区 |
-| 桥接 | `scripts/layout_kernel_bridge.py` | 合并配置，以子进程调用内核 |
-| 浏览器端 | `src/network/layout-kernel-client.js` | 生成请求、施加结果、实体校验 |
-| 回归检查 | `scripts/check_layout_kernel_client.mjs` | 用真实数据跑局部或全局优化，并做页面校验 |

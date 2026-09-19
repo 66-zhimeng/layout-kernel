@@ -1,4 +1,4 @@
-"""布管原型：给定设备位置，按主文档 12.3 / 12.4 / 12.6 布管。
+"""布管：给定设备位置，按 docs/model.md 第 3.2–3.4 节的规则布管；方法见第 5.5–5.9 节。
 
 搜索空间（非均匀轨道线）：每个轴的候选坐标 = 基础间距 pitch 的整数倍 ∪ 端口坐标
   ∪ 设备盒按 (δ_ep + D/2) 膨胀后的边界 ∪ 检修区按 D/2 膨胀后的边界 ∪ 端口坐标 ± (D + δ_pp)。
@@ -78,7 +78,7 @@ class Scene:
         self.dev, self.nets, self.rp, self.w = devices, nets, rp, weights
         self.fixed_routes = fixed_routes or {}
         # 节点内部短管（如三通内的接管）：[{"owner", "points", "D_mm"}]。对其他管是障碍；
-        # 接在该节点上的管豁免（校验时只豁免这根管的首段与末段，与网页 full-routing.js 的 fixedSpools 规则一致）
+        # 接在该节点上的管豁免（校验时只豁免这根管的首段与末段）
         c = cons.validate(rp["constraints"])
         self.cons = c
         self.pp_on = c["pipe_pipe_clearance"]["enabled"]

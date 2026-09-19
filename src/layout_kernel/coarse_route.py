@@ -12,7 +12,7 @@
     竖向边另加 coarse_vertical_penalty_mm，粗略代表高度变化代价。
 简化：不计弯头与最小直管长度；不查高度变化上限 K；同格点只看占用数，不看管径。
 
-运行：见 粗网格校准.py
+用于摆放搜索中的布管引导（placement_sp.run 的 guide 参数）。
 """
 import math
 import time

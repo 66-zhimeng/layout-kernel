@@ -1,4 +1,4 @@
-"""分块原型测试。运行：.venv/Scripts/python -m pytest 分块原型 -q"""
+"""分块测试。运行：.venv/Scripts/python -m pytest -q（在仓库根目录）"""
 import copy
 import json
 

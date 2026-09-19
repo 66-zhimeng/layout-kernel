@@ -1,4 +1,4 @@
-"""布管原型测试（手工小场景）。运行：.venv/Scripts/python -m pytest -q（在本目录）"""
+"""布管测试（手工小场景）。运行：.venv/Scripts/python -m pytest -q（在仓库根目录）"""
 import copy
 import math
 import random

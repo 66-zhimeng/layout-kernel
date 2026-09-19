@@ -2,7 +2,7 @@
 
     .venv/Scripts/python -m layout_kernel 任务书.json -o 方案.json [-q]
 
-在 01_设备与管道自动排布 目录下运行（或把该目录加入 PYTHONPATH）。
+安装后也可直接用命令 layout-kernel。
 """
 import argparse
 import json

@@ -1,6 +1,6 @@
-"""块级摆放原型：CP-SAT + 管道下界。
+"""块级摆放：CP-SAT + 管道下界。
 
-对应主文档第 12 节与《形式化求解-其他路线比较.md》路线 A/C。只做摆放，不布管；
+见 docs/model.md 第 5.3、5.4 节。只做摆放，不布管；
 管长、弯头为**可证明的下界**，真实值需布管后才知道。
 
 模型内容
@@ -18,9 +18,9 @@
                长度 ≥ k·ℓ_min + 各轴上“伸出点”坐标跨度之和（直角 Steiner 树下界）
   - 弯头下界（2 端点管网）：出发方向 d₀ = u_p，到达方向 d₁ = −u_q
       两端高度不同 → 2；否则 d₀ = d₁ → 0，垂直 → 1，相反 → 2
-  - 目标：w_A·A/A₀ + w_L·L/L₀ + w_B·B/B₀（主文档 12.8）
+  - 目标：w_A·A/A₀ + w_L·L/L₀ + w_B·B/B₀（docs/model.md 第 4 节）
 
-运行：.venv/Scripts/python placement_cpsat.py [每个模型的秒数，默认 60]
+主要提供摆放校验器 validate（placement_sp 也用它评分）与小规模的 CP-SAT 精确摆放。
 """
 import json
 import math
@@ -90,7 +90,7 @@ def load_data(data):
         nets.append({"id": n["id"], "terms": terms})
     if "service_zones_inside_footprint" not in P:
         raise KeyError("缺少必填参数 params.service_zones_inside_footprint（检修区是否必须在占地矩形内），"
-                       "请向用户确认：矩形边界外是否可用作检修空间")
+                       "须由调用方明确：矩形边界外是否可用作检修空间")
     params = {"grid": grid, "delta": g(P["delta_ee_mm"], grid), "lmin": g(P["l_min_mm"], grid),
               "kappa": P["kappa"], "w": P["weights"],
               "zones_inside": bool(P["service_zones_inside_footprint"])}
@@ -124,7 +124,7 @@ def straight_ok(p, q, lmin):
 
 
 def two_terminal_lb_v2(p, q, lmin):
-    """v2 下界。能直连：长度 = 间距，弯头 0。
+    """两端点管网的长度 / 弯头下界（docs/model.md 第 5.4 节）。能直连：长度 = 间距，弯头 0。
     否则至少一个弯头：两端各先沿法向直行 ≥ ℓ_min，
       长度 ≥ max(|p−q|₁, 2ℓ_min + |s_p − s_q|₁)，s = 端口 + ℓ_min·u；
       弯头 ≥ bend_lb；若 bend_lb 为 0（方向一致但未对齐或太近）则 ≥ 2。"""

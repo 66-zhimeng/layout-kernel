@@ -1,9 +1,9 @@
 """三维场景任务：节点（设备 / 三通）直接给世界坐标下的包围盒与端口，每根管给两端端口。
 
-这是给已有项目接入用的入口（例如 拆件做网页 的系统管网）：对方已经有设备实例、姿态与现有管路，
+这是给已有项目接入用的入口：调用方已经有设备实例、姿态与现有管路，
 不需要设备库和摆放，只需要在当前（或候选）姿态下重新布管、比较真实指标。
 
-输入（米制、Y 向上，与网页 networkMILPInput 相同）：
+输入（场景坐标：米制、Y 向上）：
   nodes:  [{id, box: bool, orientations: [{ports: {key: {position, normal}}, box: {min, max} | null,
             spools: [[p, q], ...]}]}]          —— orientations[0] 是当前姿态，其余是允许换成的朝向
   routes: [{id, code, points, segments: [{r}], from: {key}, to: {key}, leadA, leadB, fixed, low}]
@@ -20,12 +20,12 @@ settings（全部必填）：
   pose_negotiation：姿态协商（见 _pose_negotiate）{"enabled": bool, "max_poses": 每个节点除当前外最多几个候选姿态,
     "pres_bends": 每有一根同节点的管选了别的姿态，附加多少个弯头当量（随协商轮次按 pres_fac_mult 增长）,
     "hist_bends": 姿态不一致时每轮累积的历史价（弯头当量）}
-  pipe_rules：对方的直管规则，用来推算每根管的 rho / lead（见 _straight_rules）：
+  pipe_rules：调用方的直管规则，用来推算每根管的 rho / lead（见 _straight_rules）：
     {"trim_ratio": 弯头最多占相邻直管的比例, "radius_margin_mm": 有效弯曲半径须超过管半径的量,
      "port_margin_mm": 端口直颈之外的余量, "safety": 放大系数,
-     "rule_D_mm": 对方直管规则所用的管径（网页校验一律按 0.22 m 代理管计算，不按实际外径）,
-     "rule_R_mm": 对方的名义弯曲半径（网页 0.38 m）}
-  管间净距仍按每根管的实际外径（比对方的代理管更保守）。
+     "rule_D_mm": 调用方直管规则所用的管径（调用方可能统一按某个代理管径计算，不按实际外径）,
+     "rule_R_mm": 调用方的名义弯曲半径}
+  管间净距仍按每根管的实际外径。
 返回：{"ok", "violations", "metrics", "routes": [{id, code, points}]（米制、Y 向上，含两端端口）, "timing"}
 """
 import math
@@ -43,13 +43,13 @@ RULES_REQUIRED = ["trim_ratio", "radius_margin_mm", "port_margin_mm", "safety", 
 
 
 def _straight_rules(leads, rules):
-    """把对方的直管规则换算成内核的 (rho, lmin)。内核要求：两弯之间直管 ≥ 2·rho + lmin，端口到弯 ≥ rho + lmin。
-    对方（网页 pipeSections / dimensionalSections）：弯头让位 trim = min(R, trim_ratio·相邻直管)，有效半径 trim 须
+    """把调用方的直管规则换算成内核的 (rho, lmin)。内核要求：两弯之间直管 ≥ 2·rho + lmin，端口到弯 ≥ rho + lmin。
+    调用方的规则形式：弯头让位 trim = min(R, trim_ratio·相邻直管)，有效半径 trim 须
     > D/2 + margin；端口处去掉让位后的直管 ≥ 直颈 + 变径（lead）+ port_margin。于是
       两弯之间最短  S_ee = (D/2 + margin) / trim_ratio
       端口到弯最短  S_pe = lead + R + port_margin          （若此时 trim_ratio·S_pe ≥ R）
                           (lead + port_margin)/(1 − trim_ratio)  （否则）
-    U 形回弯两边是否相碰不在这里加严，由自身净距检查处理（routing 的 self_skip_mm 与对方 selfCollision 一致）。"""
+    U 形回弯两边是否相碰不在这里加严，由自身净距检查处理（routing 的 self_clearance.skip_along_mm）。"""
     k, t, D, R = rules["safety"], rules["trim_ratio"], rules["rule_D_mm"], rules["rule_R_mm"]
     s_rad = (D / 2 + rules["radius_margin_mm"]) / t                  # 每个弯头两侧直管都要满足（含端口后的第一个弯）
     s_ee = k * s_rad
@@ -64,7 +64,7 @@ def _straight_rules(leads, rules):
 
 
 def to_k(p):
-    """网页坐标（m，Y 上）→ 内核坐标（mm，Z 上），取整到 0.1 mm。"""
+    """场景坐标（m，Y 上）→ 内核坐标（mm，Z 上），取整到 0.1 mm。"""
     return (round(p[0] * 1000, 1), round(p[2] * 1000, 1), round(p[1] * 1000, 1))
 
 
@@ -104,7 +104,7 @@ def _oblique_stub(port_w, normal_w, baseline_points, stub_mm):
             out = [0, 0, 0]
             out[i] = 1 if d[i] > 0 else -1
             return b, tuple(out), list(baseline_points[1])
-    exact = [port_w[i] + normal_w[i] * stub_mm / 1000 for i in range(3)]   # 网页坐标下精确沿法向，不经取整
+    exact = [port_w[i] + normal_w[i] * stub_mm / 1000 for i in range(3)]   # 场景坐标下精确沿法向，不经取整
     i = max((0, 1), key=lambda k: abs(n[k]))
     out = [0, 0, 0]
     out[i] = 1 if n[i] > 0 else -1
@@ -112,12 +112,12 @@ def _oblique_stub(port_w, normal_w, baseline_points, stub_mm):
 
 
 def build_scene(inp, settings, fixed_ids=(), deltas=None, ghosts=None, alts=None, window=None):
-    """网页优化输入 → routing.Scene。返回 (Scene, 元数据)。fixed_ids 中的管保持原路径，作为障碍。
-    deltas = {节点 id: [dX, dY, dZ]}（网页坐标，米、Y 向上）：该节点的端口与包围盒整体平移。平移过的节点，
+    """场景输入 → routing.Scene。返回 (Scene, 元数据)。fixed_ids 中的管保持原路径，作为障碍。
+    deltas = {节点 id: [dX, dY, dZ]}（场景坐标，米、Y 向上）：该节点的端口与包围盒整体平移。平移过的节点，
     其斜向端口不再沿用基线里的斜段，按法向重新伸出。
     姿态协商用：ghosts = {虚拟节点: 真实节点}（候选姿态，只提供端口，不是障碍，其端口可穿过真实节点当前的盒）；
     alts = {端口 key: [(虚拟端口 key, 姿态序号), ...]}：接在该端口上的管两端可改接这些候选端口。
-    window = {"min", "max"}（网页坐标）：网格只建在这个范围内（候选评估用，见 _crop）。"""
+    window = {"min", "max"}（场景坐标）：网格只建在这个范围内（候选评估用，见 _crop）。"""
     ghosts, alts = ghosts or {}, alts or {}
     deltas = deltas or {}
     miss = [k for k in SETTINGS_REQUIRED if k not in settings]
@@ -241,8 +241,8 @@ def _inside_mm(dev, key):
 
 
 def _lead_with_inside(lead, inside, D, rules, cons_cfg):
-    """端口在设备盒内：对方的弯头让位按整段直管（含盒内部分）的比例计，弯头圆弧须整段在盒外并与设备留净距。
-    因此把盒内长度并入端口直颈再套用对方的直管规则；盒外至少留 管半径 + 管—设备净距 − 端口余量。"""
+    """端口在设备盒内：调用方的弯头让位按整段直管（含盒内部分）的比例计，弯头圆弧须整段在盒外并与设备留净距。
+    因此把盒内长度并入端口直颈再套用调用方的直管规则；盒外至少留 管半径 + 管—设备净距 − 端口余量。"""
     if inside <= 0:
         return lead
     gap = cons_cfg["pipe_equipment_clearance"]["gap_mm"] if cons_cfg["pipe_equipment_clearance"]["enabled"] else 0.0
@@ -303,7 +303,7 @@ def _route_once(inp, settings, fixed_ids=(), deltas=None, log=None, window=None)
 def _baseline(inp, settings, deltas=None):
     """把输入里范围内各管的现有路径换算成内核折线，用内核校验器检查并计算代价，作为比较基准（省去一次整网重布）。
     斜口的斜段不在内核折线里：沿用基线斜段时去掉它。任何一根不符合内核规则（非轴向、端口不符、违规）就返回
-    (None, 原因)，由调用方改为整网重布。返回的结果带 "web"：原样的网页路径（不经取整）。"""
+    (None, 原因)，由调用方改为整网重布。返回的结果带 "web"：原样的场景路径（不经取整）。"""
     sc, meta = build_scene(inp, settings, (), deltas)
     owner = {k: n["id"] for n in inp["nodes"] for k in n["orientations"][0]["ports"]}
     routes, web = {}, {}
@@ -346,7 +346,7 @@ def _to_web_routes(meta, routes):
         A, B = list(meta["port_w"][a]["position"]), list(meta["port_w"][b]["position"])
         SA, SB = meta["stubs"].get(a), meta["stubs"].get(b)
         inner = [to_w(q) for q in pts[1:-1]]
-        # 内核坐标取整到 0.1 mm；与端口（或斜段终点）共线的坐标改回精确值，避免对方看到微斜的管段
+        # 内核坐标取整到 0.1 mm；与端口（或斜段终点）共线的坐标改回精确值，避免调用方看到微斜的管段
         refs = [c for c in (A, B, SA, SB) if c is not None]
         for q in inner:
             for k in range(3):
@@ -360,7 +360,7 @@ def _to_web_routes(meta, routes):
 
 
 def route_scene(inp, settings, fixed_ids=(), log=None):
-    """设备不动，重布（未固定的）全部管道。返回网页坐标下的结果。"""
+    """设备不动，重布（未固定的）全部管道。返回场景坐标下的结果。"""
     t0 = time.time()
     r = _route_once(inp, settings, fixed_ids, None, log)
     return {"ok": r["ok"], "violations": r["viol"],
@@ -395,16 +395,16 @@ def _candidates(inp, meta0, movable, radius_m):
     for nid, dev in meta0["sc"].dev.items():
         for k, v in dev["ports"].items():
             kdir[k] = v[3:]
-    exact = {k: (meta0["stubs"].get(k) or p["position"]) for k, p in meta0["port_w"].items()}   # 网页坐标（米）
+    exact = {k: (meta0["stubs"].get(k) or p["position"]) for k, p in meta0["port_w"].items()}   # 场景坐标（米）
 
-    def wdir(k):                                                  # 内核方向 → 网页坐标轴下标
+    def wdir(k):                                                  # 内核方向 → 场景坐标轴下标
         d = kdir[k]
         return {0: 0, 1: 2, 2: 1}[[i for i in range(3) if d[i]][0]]
     pipes = [r for r in inp["routes"] if not r.get("fixed")]
     out = []
     # ---------------- 串联拉直
     inline = {nid: _inline_axis(nodes[nid]) for nid in movable}
-    inline = {k: {0: 0, 1: 2, 2: 1}[v] for k, v in inline.items() if v is not None}    # 转成网页坐标轴
+    inline = {k: {0: 0, 1: 2, 2: 1}[v] for k, v in inline.items() if v is not None}    # 转成场景坐标轴
     adj = {nid: set() for nid in inline}
     for r in pipes:
         a, b = owner[r["from"]["key"]], owner[r["to"]["key"]]
@@ -527,7 +527,7 @@ def _sub_input(inp, orient, inc, routes_w):
 
 
 def _window(inp, deltas, inc, routes_w, margin_m):
-    """候选评估的局部窗口（网页坐标）：要重布的管的现有路径、被移动节点（新姿态）的端口与盒，外扩 margin_m。"""
+    """候选评估的局部窗口（场景坐标）：要重布的管的现有路径、被移动节点（新姿态）的端口与盒，外扩 margin_m。"""
     pts = [q for rid in inc for q in routes_w[rid]]
     owner = {k: n["id"] for n in inp["nodes"] for k in n["orientations"][0]["ports"]}
     for r in inp["routes"]:
@@ -594,7 +594,7 @@ def _optimize(inp, settings, log=None):
     log = log or (lambda _l: None)
     t0 = time.time()
     limit = float(inp.get("seconds") or math.inf)
-    radius = float(inp.get("radius") or 0)                        # 各轴移动范围（米，网页坐标）
+    radius = float(inp.get("radius") or 0)                        # 各轴移动范围（米，场景坐标）
     movable = [n["id"] for n in inp["nodes"] if n.get("move")]
     rotatable = [n["id"] for n in inp["nodes"] if len(n["orientations"]) > 1]
     owner = {k: n["id"] for n in inp["nodes"] for k in (x for o in n["orientations"] for x in o["ports"])}
@@ -829,8 +829,8 @@ def _posed(inp, orient):
 
 
 def _pose_est(ori, d, pipes, exact, kdir, w, sc):
-    """节点取朝向 ori、平移 d（网页坐标，相对原始位置）时，相连各管的代价估计：端口间曼哈顿距离 + 至少几个弯。
-    pipes = [(本节点端口, 对端端口)]；对端按当前位置（exact：网页坐标，斜口取斜段终点；kdir：内核出管方向）。"""
+    """节点取朝向 ori、平移 d（场景坐标，相对原始位置）时，相连各管的代价估计：端口间曼哈顿距离 + 至少几个弯。
+    pipes = [(本节点端口, 对端端口)]；对端按当前位置（exact：场景坐标，斜口取斜段终点；kdir：内核出管方向）。"""
     est = 0.0
     for mine, other in pipes:
         if other not in exact or mine not in ori["ports"]:
@@ -994,7 +994,7 @@ def _violating_nodes(inp, viol):
 
 
 def _shifted(inp, deltas):
-    """按已接受的平移更新节点端口 / 包围盒（网页坐标），供生成下一轮候选。"""
+    """按已接受的平移更新节点端口 / 包围盒（场景坐标），供生成下一轮候选。"""
     if not deltas:
         return inp
     nodes = []

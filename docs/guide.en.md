@@ -5,7 +5,7 @@
 This guide covers every public interface of layout-kernel: how to call it, what to send, what comes back, and how errors are reported. Runnable examples are included.
 
 - Field-level details of the task file, the objective and the constraint registry: [contract.md](contract.md) (in Chinese).
-- The mathematical model: [model.md](model.md) (in Chinese).
+- The mathematical model and solution method: [model.en.md](model.en.md).
 
 **Contents**
 
@@ -18,7 +18,6 @@ This guide covers every public interface of layout-kernel: how to call it, what 
 7. [Constraint configuration](#7-constraint-configuration)
 8. [Tuning](#8-tuning)
 9. [Errors and troubleshooting](#9-errors-and-troubleshooting)
-10. [Case study: a Three.js piping web app](#10-case-study)
 
 ---
 
@@ -43,7 +42,7 @@ python -m venv .venv
 
 This installs two commands: `layout-kernel` (task file) and `layout-kernel-scene` (scene).
 
-**Callers don't need the kernel's dependencies.** Another project can keep the path to the kernel venv's Python and run `python -m layout_kernel.scene_cli` as a subprocess, so its own environment needs no numpy or numba (see §10).
+**Callers don't need the kernel's dependencies.** Another project can keep the path to the kernel venv's Python and run `python -m layout_kernel.scene_cli` as a subprocess, so its own environment needs no numpy or numba (see §4.6).
 
 For development:
 
@@ -60,7 +59,7 @@ python -m venv .venv && .venv/Scripts/python -m pip install -e ".[test,plot]"
 3. **The validator is the source of truth.** `ok`, `violations` and all metrics come from the geometry-only validator `routing.check_routes`, not from solver internals.
 4. **Failure is a normal return.** When routing fails or leaves violations, the result is `ok: false` with the violations spelled out. Only invalid input raises; on the command line it prints an error JSON and exits non-zero.
 5. **Heuristic, with a lower bound.** Results are feasible and good, but not proven optimal. `lower_bound.gap` gives the maximum distance to a bound (§4.3).
-6. **Units**: the scene interface uses meters with **Y up** (as in Three.js). The task file and the modules use millimeters with **Z up**. The scene interface converts internally.
+6. **Units**: the scene interface uses meters with **Y up** (the usual 3D-engine convention). The task file and the modules use millimeters with **Z up**. The scene interface converts internally.
 7. **Multiprocessing**: `route_workers > 1` and task-file placement use spawn-based processes. When calling from Python, put the entry code under `if __name__ == "__main__":`.
 
 ---
@@ -154,13 +153,13 @@ A node with a single pose and `move: false` is never changed.
 | `weights` | `{area, length, bends, height_changes}`: objective weights |
 | `scale` | `{A0, L0, B0, C0, kappa, l_min_mm}`: normalization scales (area in mm², length in mm, bend count, elevation-change count), maximum aspect ratio, and minimum straight run |
 | `oblique_stub_mm` | Length of the oblique stub pushed out along the normal when the baseline has none |
-| `pipe_rules` | The caller's straight and bend rules, which the kernel converts into straight-run requirements: `{trim_ratio, radius_margin_mm, port_margin_mm, safety, rule_D_mm, rule_R_mm}` |
+| `pipe_rules` | The caller's straight and bend rules, which the kernel converts into straight-run requirements: `{trim_ratio, radius_margin_mm, port_margin_mm, safety, rule_D_mm, rule_R_mm}`; see [model §3.2](model.en.md#32-route-geometry) |
 | `rotation_candidates` | How many orientations per rotatable node are actually re-routed each round (after ranking by estimate) |
 | `lower_bound` | `{enabled, max_expansions}`: whether to report the lower bound and gap |
 | `candidate_routing` | Lighter solver parameters used when evaluating candidates, such as `{max_iters, stall_iters, max_expansions, cleanup_max_expansions}`. It **must include `window_mm`**: each candidate is routed only inside a window around the affected pipes and moved nodes, expanded by this margin |
 | `pose_negotiation` | `{enabled, max_poses, pres_bends, hist_bends}` (§4.4). The other three keys are required even when `enabled` is false |
 
-For a complete working `settings` block (matching the web app's validation rules), copy the one in [examples/scene/request.json](../examples/scene/request.json).
+For a complete working `settings` block, copy the one in [examples/scene/request.json](../examples/scene/request.json) and adjust it.
 
 ### 4.3 Result
 
@@ -197,7 +196,7 @@ For a complete working `settings` block (matching the web app's validation rules
 ### 4.4 Optimization pipeline
 
 1. **Baseline**: check the current paths with the kernel's validator. If they pass, use them directly. If only a few pipes fail, re-route just those; if many fail, re-route everything.
-2. **Pose negotiation** (optional, `pose_negotiation.enabled`): candidate poses of movable nodes join negotiated routing, and all poses are chosen in one pass (see contract.md §7).
+2. **Pose negotiation** (optional, `pose_negotiation.enabled`): candidate poses of movable nodes join negotiated routing, and all poses are chosen in one pass (see [model §5.11](model.en.md#511-pose-negotiation)).
 3. **Candidate rounds**:
    - Candidates come in three kinds: line-straightening (a chain of connected in-line devices shifts onto one line), single alignment, and re-orientation.
    - They are evaluated in parallel on `route_workers` processes, each re-routing only the affected pipes inside a local window.
@@ -244,7 +243,7 @@ const out = JSON.parse(p.stdout.toString('utf8'));
 if (p.status !== 0) throw new Error(out.error);
 ```
 
-**Browser**: a browser can't start a process, so it needs a local service to forward the call (see §10).
+**Browser**: a browser can't start a process. Run a small local service that accepts the request (for example `POST /api/layout`), forwards it to the kernel with the subprocess pattern above, and returns the result.
 
 ---
 
@@ -399,27 +398,3 @@ Constraints go under `routing.constraints`, and all 13 must be present:
 | The caller's validation fails while the kernel says `ok: true` | The two sets of rules differ | The caller's rules win. Save the request and result, compare the failing pipe's geometry, and adjust `pipe_rules` or the clearances if needed |
 
 Messages are currently in Chinese; the table above maps the main ones.
-
-## 10. Case study
-
-The kernel is integrated with a Three.js piping-network web app (230 pipes, 183 nodes). The browser calls the kernel through a local service. Each kernel result must also pass the app's own solid-geometry validation before it is offered to the user:
-
-```mermaid
-sequenceDiagram
-    participant B as Browser (Web Worker)
-    participant S as Local service serve.py
-    participant K as layout-kernel (subprocess)
-    B->>S: POST /api/layout-kernel {input}
-    S->>S: read data/layout-kernel.json (settings, per-pipe weights, keep-outs)
-    S->>K: python -m layout_kernel.scene_cli (request on stdin)
-    K-->>S: result JSON on stdout
-    S-->>B: result
-    B->>B: apply orientations / offsets, replace routes, validate; offer only if better
-```
-
-| Part | File (in the web app repo) | Role |
-|---|---|---|
-| Config | `data/layout-kernel.json` | Kernel Python path, timeout, full `settings`, per-pipe weights (by pipe code), keep-outs |
-| Bridge | `scripts/layout_kernel_bridge.py` | Merges the config and runs the kernel as a subprocess |
-| Browser side | `src/network/layout-kernel-client.js` | Builds the request, applies the result, validates |
-| Regression | `scripts/check_layout_kernel_client.mjs` | Runs local or global optimization on real data and validates in the app |

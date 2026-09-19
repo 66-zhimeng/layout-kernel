@@ -1,4 +1,4 @@
-"""内核接口测试。运行：.venv/Scripts/python -m pytest -q（在 01_设备与管道自动排布 目录下）"""
+"""内核接口测试。运行：.venv/Scripts/python -m pytest -q（在仓库根目录）"""
 import copy
 import json
 
