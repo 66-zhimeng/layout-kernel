@@ -40,6 +40,10 @@ POSE_REQUIRED = ["enabled", "max_poses", "pres_bends", "hist_bends"]
 SERIAL_NETS = 8                                                 # 每个并行进程至少分到的管数
 REACH_M = 1.0                                                   # 局部窗口外的东西离窗口多远以上才去掉（米；须大于各类净距）
 RULES_REQUIRED = ["trim_ratio", "radius_margin_mm", "port_margin_mm", "safety", "rule_D_mm", "rule_R_mm"]
+COMPACT_AXES = (0, 2)                                           # 整串靠拢只压水平两轴（场景坐标 X、Z）；竖向受顶棚与低位管约束
+COMPACT_MOVES = 6                                               # 每轮真正评估的靠拢候选数上限（全部切面里按估计收益取前几个）
+COMPACT_STEPS = (1.0, 0.5)                                      # 每个切面试的行程比例（相对估计出的可压缩余量）
+COMPACT_MIN_M = 0.05                                            # 行程小于这个值不值得重布一次（米）
 
 
 def _straight_rules(leads, rules):
@@ -471,6 +475,75 @@ def _candidates(inp, meta0, movable, radius_m):
     return uniq
 
 
+def _dev_coord(node, exact, ax):
+    """节点在场景坐标某轴上的位置：有盒取盒心，无盒取各端口的平均；既无盒又无端口返回 None。"""
+    o = node["orientations"][0]
+    if o.get("box"):
+        return (o["box"]["min"][ax] + o["box"]["max"][ax]) / 2
+    ps = [exact[k][ax] for k in o["ports"]]
+    return sum(ps) / len(ps) if ps else None
+
+
+def _cut_room(group, ax, side, pipes, owner, exact, np_):
+    """切面一侧的 group 整体朝另一侧平移时，(可走的行程, 会变短的管数)。
+    行程取各跨切面管道在该轴上可压缩余量（两端口在该轴上的间距减去最小直管长度）的最小值。"""
+    room, shorter = math.inf, 0
+    for r in pipes:
+        ka, kb = r["from"]["key"], r["to"]["key"]
+        in_a, in_b = owner[ka] in group, owner[kb] in group
+        if in_a == in_b:                                          # 两端同侧：整串平移，这根管原样跟着走
+            continue
+        mine, other = (ka, kb) if in_a else (kb, ka)
+        toward = side * (exact[mine][ax] - exact[other][ax])
+        if toward <= 1e-9:                                        # 这根管反而会被拉长：不限制行程，由评估定优劣
+            continue
+        npar = np_.get(r["id"])
+        reserve = (2 * npar["rho"] + npar["lmin"]) / 1000 if npar else 0.0   # 弯头圆弧 + 最小直管，单位米
+        room = min(room, toward - reserve)
+        shorter += 1
+    return room, shorter
+
+
+def _compaction_candidates(inp, meta0, movable, radius_m):
+    """整串靠拢：沿 X / Z 取一个切面，把切面一侧的可动设备整体朝另一侧平移，压缩整体占地。
+    与“串联拉直”“单个对齐”互补——那两族的位移永远垂直于管道走向，只消弯头，不会缩短直管段。
+
+    切面取自各设备在该轴上坐标的相邻中点（全部设备，可动的一串也要能和固定设备分开）。所有切面都估一遍
+    收益（行程 × 会变短的管数），只把收益最大的 COMPACT_MOVES 个按 COMPACT_STEPS 分档发出去：挤紧过的
+    切面余量变小，下一轮自然轮到别处，不会总压同几个地方。行程只是估计，靠拢会不会撞设备、够不够绕，
+    由候选评估的重布与校验器判定。"""
+    nodes = {n["id"]: n for n in inp["nodes"]}
+    owner = {k: n["id"] for n in inp["nodes"] for k in n["orientations"][0]["ports"]}
+    exact = {k: (meta0["stubs"].get(k) or p["position"]) for k, p in meta0["port_w"].items()}
+    np_ = meta0["sc"].np
+    pipes = [r for r in inp["routes"] if not r.get("fixed")]
+    scored, seen = [], set()
+    for ax in COMPACT_AXES:
+        pos = {nid: c for nid, n in nodes.items() if (c := _dev_coord(n, exact, ax)) is not None}
+        vals = sorted(set(pos.values()))
+        for cut in [(a + b) / 2 for a, b in zip(vals, vals[1:])]:
+            for side in (1, -1):                                  # side = +1：切面正侧的一串朝负向靠；−1 反之
+                group = frozenset(nid for nid in movable if nid in pos and (pos[nid] - cut) * side > 0)
+                if not group or (group, ax, side) in seen:
+                    continue
+                seen.add((group, ax, side))
+                room, shorter = _cut_room(group, ax, side, pipes, owner, exact, np_)
+                if shorter and room > COMPACT_MIN_M:
+                    scored.append((room * shorter, room, ax, side, group))
+    scored.sort(key=lambda t: -t[0])
+    out = []
+    for _est, room, ax, side, group in scored[:COMPACT_MOVES]:
+        for frac in COMPACT_STEPS:
+            step = min(room * frac, radius_m)
+            if step <= COMPACT_MIN_M:
+                continue
+            d = [0.0, 0.0, 0.0]
+            d[ax] = -side * step
+            out.append((f"整串靠拢：{len(group)} 个设备沿轴 {ax} 移动 {d[ax]:.2f} m",
+                        {nid: tuple(d) for nid in group}))
+    return out
+
+
 def _net_costs(r):
     """每根重布管的代价（与 _route_once 的总代价同一口径）。"""
     return {nid: rt.net_cost(r["sc"], nid, v) for nid, v in r["met"]["per_net"].items()}
@@ -670,7 +743,10 @@ def _optimize(inp, settings, log=None):
     try:
         while (movable and radius > 0 or rotatable) and time.time() - t0 < limit:
             now = _shifted(_posed(inp, orient), deltas)
-            cands = [(nm, mv, {}) for nm, mv in (_candidates(now, info, movable, radius) if movable and radius > 0 else [])]
+            moves = []
+            if movable and radius > 0:                             # 先对齐（局部、便宜），再整串靠拢（范围大、按估计收益排序）
+                moves = _candidates(now, info, movable, radius) + _compaction_candidates(now, info, movable, radius)
+            cands = [(nm, mv, {}) for nm, mv in moves]
             cands += _rotation_candidates(now, info, rotatable, orient, deltas, settings, settings["rotation_candidates"])
             tasks, meta = [], []
             for name, move, rot in cands:

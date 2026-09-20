@@ -198,7 +198,7 @@ For a complete working `settings` block, copy the one in [examples/scene/request
 1. **Baseline**: check the current paths with the kernel's validator. If they pass, use them directly. If only a few pipes fail, re-route just those; if many fail, re-route everything.
 2. **Pose negotiation** (optional, `pose_negotiation.enabled`): candidate poses of movable nodes join negotiated routing, and all poses are chosen in one pass (see [model §5.11](model.en.md#511-pose-negotiation)).
 3. **Candidate rounds**:
-   - Candidates come in three kinds: line-straightening (a chain of connected in-line devices shifts onto one line), single alignment, and re-orientation.
+   - Candidates come in four kinds: line-straightening (a chain of connected in-line devices shifts onto one line), single alignment, chain compaction (every movable device on one side of a cut plane is translated towards the other side, shortening straight runs), and re-orientation.
    - They are evaluated in parallel on `route_workers` processes, each re-routing only the affected pipes inside a local window.
    - Among the improving candidates, a batch of mutually independent ones is re-checked and accepted at once.
 4. **Finish**: when no candidate improves, or time runs out: if time remains, do one full joint re-route at the final poses and keep the better result; otherwise check the step-by-step result once on the full scene, and re-route if that check fails.

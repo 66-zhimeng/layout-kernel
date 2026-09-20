@@ -87,7 +87,7 @@ Each pipe can have its own weight multipliers.
 | Multi-terminal | Connect the nearest pair, then attach each remaining terminal to the tree, nearest first: inside a straight segment, or on an elbow leg's extension (the elbow becomes a tee) | Heuristic |
 | Multiple pipes | **PathFinder negotiation**: edge cost c_L·len·(1+h_e)·(1+π·n_e); history h_e accumulates on conflicted edges and pressure π grows each round; optimistic parallel search over a shared occupancy map | Heuristic |
 | Cleanup | For each clash X–Y try: X only / Y only / X then Y / Y then X, with all other pipes as hard obstacles | Heuristic; tells "no path" apart from "hit the limit" |
-| Moving equipment | Start from the current layout as the baseline. Candidates are line-straightening, single alignment and pose changes. Each one re-routes the affected pipes inside a **local window**, evaluated in parallel; a batch of independent improvements is accepted at once | Heuristic |
+| Moving equipment | Start from the current layout as the baseline. Candidates are line-straightening, single alignment, chain compaction and pose changes. Each one re-routes the affected pipes inside a **local window**, evaluated in parallel; a batch of independent improvements is accepted at once | Heuristic |
 | Pose negotiation (optional) | Candidate poses become virtual nodes, and multi-start / multi-goal A\* picks both end poses at once. Disagreement at a node is priced like congestion, round after round, until all pipes agree | Heuristic |
 | Lower bound and gap | At the final poses, LB = sum of each two-terminal pipe's exact shortest route on its own; gap = (cost − LB)/cost | A valid lower bound at the final poses |
 
