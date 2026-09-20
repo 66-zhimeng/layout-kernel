@@ -46,3 +46,17 @@ def test_cli_reports_errors_as_json():
     assert p.returncode == 1
     out = json.loads(p.stdout.decode("utf-8"))
     assert out["ok"] is False and "settings" in out["error"]
+
+
+def test_high_port_under_ceiling_is_on_grid():
+    """顶棚余量按包络（最大）管径算，不能把细管的高位端口裁出网格：
+    否则布管已通过、算下界时才抛 OffGrid，整个优化结果被丢掉（网页端表现为“优化未应用”）。"""
+    inp, st = copy.deepcopy(REQ["input"]), copy.deepcopy(REQ["settings"])
+    st["routing"]["constraints"]["ceiling"] = {"enabled": True, "z_max_mm": 560}   # 端口标高 500
+    for k in ("pipe_pipe_clearance", "self_clearance", "pipe_equipment_clearance", "equipment_spacing"):
+        st["routing"]["constraints"][k]["enabled"] = False
+    inp["routes"][1].update(segments=[{"r": 0.5}], fixed=True)   # 固定粗管：只把包络管径抬到 1000
+    inp["radius"] = 0
+    out = scene.optimize_scene(inp, st)
+    assert out["ok"] and out["violations"] == []
+    assert out["lower_bound"]["valid"]

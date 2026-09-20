@@ -158,6 +158,9 @@ class Grid:
         else:                                                           # 不限顶高：场景最高点之上再留 margin
             zhi = max(q[2] for q in pts) + mg
         zlo = min([D / 2] + port_z)
+        # 端口必须落在网格上：顶棚余量按包络（最大）管径算，不能把比它细的管的高位端口裁掉；
+        # 各管自身的顶棚限制由 net_param 的 zc_max 在搜索里把关，端口本身过高由校验器报违规。
+        zhi = max([zhi] + port_z)
         lim = [(xs0, xs1), (ys0, ys1), (zlo, zhi)]
         if sc.window is not None:                                       # 局部窗口：网格不超出窗口
             lim = [(max(lim[a][0], sc.window[a]), min(lim[a][1], sc.window[a + 3])) for a in range(3)]
@@ -1250,7 +1253,11 @@ def _lb_one(nid):
     if len(net["terms"]) != 2:
         return nid, None, "多端点管网：树为贪心构造，不给下界"
     stats = {"expansions": 0, "exhausted": 0}
-    br, why = route_net(G, sc, net, {"halo": _Zero(), "hist": _Zero(), "pres": 0.0, "stats": stats, "relax_self": True})
+    try:
+        br, why = route_net(G, sc, net, {"halo": _Zero(), "hist": _Zero(), "pres": 0.0, "stats": stats,
+                                         "relax_self": True})
+    except OffGrid as ex:                                        # 端口不在网格上：这根管不给下界，不影响方案本身
+        return nid, None, f"端口不在布管网格上：{ex}"
     if br is None:
         return nid, None, ("超过扩展上限" if stats["exhausted"] else f"单独也布不通：{why}")
     per = check_routes(sc, {nid: br})[1]["per_net"][nid]
