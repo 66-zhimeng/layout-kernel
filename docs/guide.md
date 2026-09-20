@@ -117,6 +117,7 @@ python examples/scene/run_scene.py
 |---|---|---|
 | `id` | 字符串 | 节点 id，全局唯一 |
 | `move` | 布尔 | 能否平移。平移范围见 `input.radius` |
+| `move_axes` | `[布尔, 布尔, 布尔]`，可选 | 分别表示能否沿场景的 X、Y（向上）、Z 轴平移；不写时三轴都能动。用于只锁某一两个轴 |
 | `orientations` | 数组，至少 1 个 | **第 0 个是当前姿态**，其余是允许换成的姿态（旋转、三通换向、同向口交换）。每个姿态的端口都要由调用方按该姿态算好 |
 | `orientations[].ports` | `{端口 key: {position, normal}}` | 端口 key 在整个场景里唯一；`position` 为 `[x, y, z]`（米）；`normal` 为出管方向的单位向量。斜向（非轴向）法向表示斜支口，见 `oblique_stub_mm` |
 | `orientations[].box` | `{min, max}` 或 `null` | 包围盒（米）。`null` 表示没有实体盒的节点（如三通），它不挡管，实体用 `spools` 表示 |

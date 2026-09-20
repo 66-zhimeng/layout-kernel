@@ -114,3 +114,21 @@ def test_compaction_squeezes_every_gap_not_just_a_few():
     assert out["ok"] and out["violations"] == []
     assert out["metrics"]["L_m"] < 3.0                             # 原来 6 × 5 = 30 m
     assert all(out["offsets"][f"d{i}"][0] < out["offsets"][f"d{i-1}"][0] for i in range(2, 7))
+
+
+def test_move_axes_locks_a_single_axis():
+    """move_axes 逐轴锁定：锁住 X 后，沿 X 的靠拢候选不再产生，设备不动。"""
+    inp = _chain([5.0] * 3, 100.0)
+    for n in inp["nodes"]:
+        n["move_axes"] = [False, True, True]                       # 只锁 X（场景坐标，Y 向上）
+    out = scene.optimize_scene(inp, copy.deepcopy(REQ["settings"]))
+    assert out["ok"] and out["offsets"] == {}
+    free = scene.optimize_scene(_chain([5.0] * 3, 100.0), copy.deepcopy(REQ["settings"]))
+    assert free["metrics"]["L_m"] < out["metrics"]["L_m"]           # 不锁时本来压得动
+
+
+def test_move_axes_must_be_three_booleans():
+    inp = _chain([5.0], 4.0)
+    inp["nodes"][1]["move_axes"] = [False, True]
+    with pytest.raises(ValueError, match="move_axes"):
+        scene.optimize_scene(inp, copy.deepcopy(REQ["settings"]))

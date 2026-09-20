@@ -114,6 +114,7 @@ python examples/scene/run_scene.py
 |---|---|---|
 | `id` | string | Unique node id |
 | `move` | bool | Whether the node may translate (range: `input.radius`) |
+| `move_axes` | `[bool, bool, bool]`, optional | Whether it may move along the scene's X, Y (up) and Z axes. Omitted means all three are free; use it to lock only one or two axes |
 | `orientations` | array, at least 1 | **Index 0 is the current pose.** The others are poses it may switch to (rotation, tee re-orientation, swapping same-direction ports). The caller computes the ports for each pose |
 | `orientations[].ports` | `{port key: {position, normal}}` | Port keys are unique across the scene. `position` is `[x, y, z]` in meters. `normal` is the unit vector a pipe must leave along; an oblique (non-axis) normal marks an oblique branch port (see `oblique_stub_mm`) |
 | `orientations[].box` | `{min, max}` or `null` | Bounding box in meters. `null` means a node without a solid box (such as a tee): it does not block pipes, and its solid parts are given as `spools` |

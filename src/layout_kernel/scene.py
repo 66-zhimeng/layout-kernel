@@ -388,6 +388,20 @@ def _inline_axis(node):
     return a[0] if a and ps[1][1][a[0]] == -ps[0][1][a[0]] else None
 
 
+def _free_axes(inp):
+    """节点 → (能否沿 X, 能否沿 Y, 能否沿 Z 移动)。取自输入的 move_axes（场景坐标，Y 向上），缺省三轴都能动。"""
+    out = {}
+    for n in inp["nodes"]:
+        ax = n.get("move_axes")
+        if ax is None:
+            out[n["id"]] = (True, True, True)
+            continue
+        if not isinstance(ax, (list, tuple)) or len(ax) != 3:
+            raise ValueError(f"节点 {n['id']} 的 move_axes 必须是三个布尔值（场景坐标 X, Y, Z）")
+        out[n["id"]] = tuple(bool(v) for v in ax)
+    return out
+
+
 def _candidates(inp, meta0, movable, radius_m):
     """候选移动：[(说明, {节点: delta})]。
     1. 串联拉直：相连的在线设备（同一轴向）整串平移到同一条直线上。候选直线取自串外端点（斜口取斜段终点）
@@ -504,14 +518,15 @@ def _cut_room(group, ax, side, pipes, owner, exact, np_):
     return room, shorter
 
 
-def _compaction_candidates(inp, meta0, movable, radius_m):
+def _compaction_candidates(inp, meta0, movable, radius_m, free=None):
     """整串靠拢：沿 X / Z 取一个切面，把切面一侧的可动设备整体朝另一侧平移，压缩整体占地。
     与“串联拉直”“单个对齐”互补——那两族的位移永远垂直于管道走向，只消弯头，不会缩短直管段。
 
     切面取自各设备在该轴上坐标的相邻中点（全部设备，可动的一串也要能和固定设备分开）。所有切面都估一遍
     收益（行程 × 会变短的管数），只把收益最大的 COMPACT_MOVES 个按 COMPACT_STEPS 分档发出去：挤紧过的
     切面余量变小，下一轮自然轮到别处，不会总压同几个地方。行程只是估计，靠拢会不会撞设备、够不够绕，
-    由候选评估的重布与校验器判定。"""
+    由候选评估的重布与校验器判定。free 给出各节点哪些轴能动（见 _free_axes）：沿某轴靠拢时，该轴被锁的节点不进组。"""
+    free = free or {}
     nodes = {n["id"]: n for n in inp["nodes"]}
     owner = {k: n["id"] for n in inp["nodes"] for k in n["orientations"][0]["ports"]}
     exact = {k: (meta0["stubs"].get(k) or p["position"]) for k, p in meta0["port_w"].items()}
@@ -523,7 +538,8 @@ def _compaction_candidates(inp, meta0, movable, radius_m):
         vals = sorted(set(pos.values()))
         for cut in [(a + b) / 2 for a, b in zip(vals, vals[1:])]:
             for side in (1, -1):                                  # side = +1：切面正侧的一串朝负向靠；−1 反之
-                group = frozenset(nid for nid in movable if nid in pos and (pos[nid] - cut) * side > 0)
+                group = frozenset(nid for nid in movable if nid in pos and (pos[nid] - cut) * side > 0
+                                  and free.get(nid, (True, True, True))[ax])
                 if not group or (group, ax, side) in seen:
                     continue
                 seen.add((group, ax, side))
@@ -669,6 +685,7 @@ def _optimize(inp, settings, log=None):
     limit = float(inp.get("seconds") or math.inf)
     radius = float(inp.get("radius") or 0)                        # 各轴移动范围（米，场景坐标）
     movable = [n["id"] for n in inp["nodes"] if n.get("move")]
+    free = _free_axes(inp)                                        # 节点 → 三个场景轴能不能动（move_axes，缺省三轴都能动）
     rotatable = [n["id"] for n in inp["nodes"] if len(n["orientations"]) > 1]
     owner = {k: n["id"] for n in inp["nodes"] for k in (x for o in n["orientations"] for x in o["ports"])}
     scope = [r for r in inp["routes"] if not r.get("fixed")]
@@ -745,7 +762,7 @@ def _optimize(inp, settings, log=None):
             now = _shifted(_posed(inp, orient), deltas)
             moves = []
             if movable and radius > 0:                             # 先对齐（局部、便宜），再整串靠拢（范围大、按估计收益排序）
-                moves = _candidates(now, info, movable, radius) + _compaction_candidates(now, info, movable, radius)
+                moves = _candidates(now, info, movable, radius) + _compaction_candidates(now, info, movable, radius, free)
             cands = [(nm, mv, {}) for nm, mv in moves]
             cands += _rotation_candidates(now, info, rotatable, orient, deltas, settings, settings["rotation_candidates"])
             tasks, meta = [], []
@@ -754,6 +771,8 @@ def _optimize(inp, settings, log=None):
                 for nid, d in move.items():
                     acc = tuple(trial.get(nid, (0.0, 0.0, 0.0))[i] + d[i] for i in range(3))
                     if any(abs(v) > radius + 1e-9 for v in acc):
+                        break
+                    if any(abs(d[i]) > 1e-9 and not free[nid][i] for i in range(3)):   # 该轴被调用方锁住
                         break
                     trial[nid] = acc
                 else:
