@@ -1,6 +1,7 @@
 """三维场景接口测试：以文档里的示例请求为准（examples/scene/request.json），保证示例始终可运行、结论不变。"""
 import copy
 import json
+import math
 import subprocess
 import sys
 from pathlib import Path
@@ -132,3 +133,60 @@ def test_move_axes_must_be_three_booleans():
     inp["nodes"][1]["move_axes"] = [False, True]
     with pytest.raises(ValueError, match="move_axes"):
         scene.optimize_scene(inp, copy.deepcopy(REQ["settings"]))
+
+
+def test_travel_limit_only_counts_obstacles_actually_in_the_way():
+    """靠拢行程不能只看管道余量：设备撞上组外的东西之前就得停。"""
+    boxes = [([10.0, 0.0, 0.0], [11.0, 1.0, 1.0])]
+    ahead = [([0.0, 0.0, 0.0], [1.0, 1.0, 1.0], 0.12)]
+    assert abs(scene._travel_limit(boxes, ahead, 0, 1) - (10.0 - 1.0 - 0.12)) < 1e-9
+    assert scene._travel_limit(boxes, [([0.0, 5.0, 0.0], [1.0, 6.0, 1.0], 0.12)], 0, 1) == math.inf   # 另一轴错开
+    assert scene._travel_limit(boxes, [([20.0, 0.0, 0.0], [21.0, 1.0, 1.0], 0.12)], 0, 1) == math.inf  # 在身后
+    assert scene._travel_limit(boxes, ahead, 0, -1) == math.inf                                       # 反方向走
+
+
+def test_obstacles_use_the_current_paths_not_the_original_input():
+    """管的几何必须取当前路径：接受过候选之后输入里的 points 就过时了，
+    拿它当障碍会把管早已离开的位置算成挡路的，行程被误判为 0，压缩从第二轮起就停住。"""
+    inp = _chain([5.0, 5.0], 4.0)
+    owner = {k: n["id"] for n in inp["nodes"] for k in n["orientations"][0]["ports"]}
+    group = frozenset(["d2"])                                     # pipe_1（d0–d1）两端都不在组里，是障碍
+    stale = [b for b in scene._obstacles(inp, group, owner, .025, .12, {}) if b[2] == .025]
+    assert stale and stale[0][0][0] < 10
+    current = {"pipe_1": [[100.0, .5, .5], [101.0, .5, .5]]}       # 这根管已经被挪到别处
+    moved = [b for b in scene._obstacles(inp, group, owner, .025, .12, current) if b[2] == .025]
+    assert moved and moved[0][0][0] > 99, "障碍应当按当前路径算"
+
+
+def test_optimize_tries_both_axis_orders_and_keeps_the_better(monkeypatch):
+    """两个轴谁先手对结果影响很大且事先判断不出来，所以两种顺序都要跑，按代价取更好的那个；
+    `seconds` 由各趟平分，总时长不变。"""
+    seen = []
+
+    def fake(one, settings, log=None, axes=None):
+        seen.append((axes, one.get("seconds")))
+        out = {"ok": True, "cost": 10.0 if axes == (0, 2) else 20.0, "metrics": {}, "violations": [],
+               "offsets": {}, "moves": []}
+        return out, one, {}
+
+    monkeypatch.setattr(scene, "_optimize", fake)
+    monkeypatch.setattr(scene, "_attach_bound", lambda out, *a, **k: out)
+    inp = _chain([5.0], 4.0)
+    inp["seconds"] = 60
+    out = scene.optimize_scene(inp, REQ["settings"])
+    assert [s[0] for s in seen] == list(scene.COMPACT_ORDERS), "两种先手顺序都要跑"
+    assert all(s[1] == 30 for s in seen), "时间上限由两趟平分"
+    assert out["cost"] == 10.0, "应当采用代价更低的那一趟"
+
+
+def test_optimize_runs_once_when_nothing_can_move(monkeypatch):
+    """不许平移时没有靠拢候选，两种顺序等价，只跑一趟，不白花一倍时间。"""
+    seen = []
+    monkeypatch.setattr(scene, "_optimize",
+                        lambda one, settings, log=None, axes=None: (seen.append(axes) or
+                        ({"ok": True, "cost": 1.0, "metrics": {}, "violations": [], "offsets": {}, "moves": []},
+                         one, {})))
+    monkeypatch.setattr(scene, "_attach_bound", lambda out, *a, **k: out)
+    inp = _chain([5.0], 0.0)                                       # radius = 0
+    scene.optimize_scene(inp, REQ["settings"])
+    assert seen == [None], "不该跑第二趟"

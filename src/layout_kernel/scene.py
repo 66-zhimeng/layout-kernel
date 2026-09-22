@@ -40,9 +40,12 @@ POSE_REQUIRED = ["enabled", "max_poses", "pres_bends", "hist_bends"]
 SERIAL_NETS = 8                                                 # 每个并行进程至少分到的管数
 REACH_M = 1.0                                                   # 局部窗口外的东西离窗口多远以上才去掉（米；须大于各类净距）
 RULES_REQUIRED = ["trim_ratio", "radius_margin_mm", "port_margin_mm", "safety", "rule_D_mm", "rule_R_mm"]
-COMPACT_AXES = (0, 2)                                           # 整串靠拢只压水平两轴（场景坐标 X、Z）；竖向受顶棚与低位管约束
-COMPACT_MOVES = 6                                               # 每轮真正评估的靠拢候选数上限（全部切面里按估计收益取前几个）
-COMPACT_STEPS = (1.0, 0.5)                                      # 每个切面试的行程比例（相对估计出的可压缩余量）
+COMPACT_AXES = (2, 0)                                           # 整串靠拢只压水平两轴（场景坐标 Z、X）；竖向受顶棚与低位管约束
+COMPACT_ORDERS = ((2, 0), (0, 2))                               # 两个轴的先手顺序：谁先压结果差别很大，且事先判断不出来，
+                                                                # 所以两种都跑一遍、按校验器口径取更好的那个（见 _optimize 的 axes）
+COMPACT_MOVES = 16                                              # 每轮每个轴真正评估的切面数上限（按估计收益取前几个）
+COMPACT_LOOKAHEAD = 4                                           # 算设备行程时多看几倍的切面，再按修正后的收益挑（算行程比算管道余量贵）
+COMPACT_STEPS = (1.0, 0.5, 0.25)                                # 每个切面试的行程比例（满行程常常布不通，留退路）
 COMPACT_MIN_M = 0.05                                            # 行程小于这个值不值得重布一次（米）
 
 
@@ -518,7 +521,49 @@ def _cut_room(group, ax, side, pipes, owner, exact, np_):
     return room, shorter
 
 
-def _compaction_candidates(inp, meta0, movable, radius_m, free=None):
+def _node_box(node):
+    b = node["orientations"][0].get("box")
+    return (list(b["min"]), list(b["max"])) if b else None
+
+
+def _obstacles(inp, group, owner, gap_ep, gap_dev, routes_w):
+    """组整体平移时撞得上的组外东西：组外设备的盒（按设备间距），以及两端都不在组里的管的管段盒
+    （按管—设备净距）。两端有一端在组里的管会跟着重布，不算障碍。返回 [(min, max, 需留净距)]。
+    管的几何取 routes_w 里的当前路径——inp 里的 points 是本次优化开始时的，接受过候选后就过时了。"""
+    out = []
+    for n in inp["nodes"]:
+        if n["id"] in group:
+            continue
+        b = _node_box(n)
+        if b:
+            out.append((b[0], b[1], gap_dev))
+    for r in inp["routes"]:
+        if owner[r["from"]["key"]] in group or owner[r["to"]["key"]] in group:
+            continue
+        rad = max(s["r"] for s in r["segments"])
+        pts = routes_w.get(r["id"]) or r["points"]
+        for a, b in zip(pts, pts[1:]):
+            out.append(([min(a[i], b[i]) - rad for i in range(3)],
+                        [max(a[i], b[i]) + rad for i in range(3)], gap_ep))
+    return out
+
+
+def _travel_limit(boxes, obstacles, ax, side):
+    """组沿 −side 方向整体平移，撞上组外障碍之前还能走多远（米）。
+    只有在另外两个轴上（含净距）重叠的障碍才拦得住；已经在身后的障碍越走越远，不限制。"""
+    perp = [i for i in range(3) if i != ax]
+    limit = math.inf
+    for lo, hi in boxes:
+        for olo, ohi, gap in obstacles:
+            if any(lo[i] > ohi[i] + gap or hi[i] < olo[i] - gap for i in perp):
+                continue
+            ahead = (lo[ax] - ohi[ax]) if side > 0 else (olo[ax] - hi[ax])
+            if ahead >= -1e-9:
+                limit = min(limit, ahead - gap)
+    return max(0.0, limit)
+
+
+def _compaction_candidates(inp, meta0, movable, radius_m, free=None, routes_w=None, axes=None):
     """整串靠拢：沿 X / Z 取一个切面，把切面一侧的可动设备整体朝另一侧平移，压缩整体占地。
     与“串联拉直”“单个对齐”互补——那两族的位移永远垂直于管道走向，只消弯头，不会缩短直管段。
 
@@ -526,14 +571,14 @@ def _compaction_candidates(inp, meta0, movable, radius_m, free=None):
     收益（行程 × 会变短的管数），只把收益最大的 COMPACT_MOVES 个按 COMPACT_STEPS 分档发出去：挤紧过的
     切面余量变小，下一轮自然轮到别处，不会总压同几个地方。行程只是估计，靠拢会不会撞设备、够不够绕，
     由候选评估的重布与校验器判定。free 给出各节点哪些轴能动（见 _free_axes）：沿某轴靠拢时，该轴被锁的节点不进组。"""
-    free = free or {}
+    free, routes_w, axes = free or {}, routes_w or {}, axes or COMPACT_AXES
     nodes = {n["id"]: n for n in inp["nodes"]}
     owner = {k: n["id"] for n in inp["nodes"] for k in n["orientations"][0]["ports"]}
     exact = {k: (meta0["stubs"].get(k) or p["position"]) for k, p in meta0["port_w"].items()}
     np_ = meta0["sc"].np
     pipes = [r for r in inp["routes"] if not r.get("fixed")]
     scored, seen = [], set()
-    for ax in COMPACT_AXES:
+    for ax in axes:
         pos = {nid: c for nid, n in nodes.items() if (c := _dev_coord(n, exact, ax)) is not None}
         vals = sorted(set(pos.values()))
         for cut in [(a + b) / 2 for a, b in zip(vals, vals[1:])]:
@@ -545,10 +590,30 @@ def _compaction_candidates(inp, meta0, movable, radius_m, free=None):
                 seen.add((group, ax, side))
                 room, shorter = _cut_room(group, ax, side, pipes, owner, exact, np_)
                 if shorter and room > COMPACT_MIN_M:
-                    scored.append((room * shorter, room, ax, side, group))
+                    scored.append((room * shorter, room, shorter, ax, side, group))
     scored.sort(key=lambda t: -t[0])
+    cons = meta0["sc"].cons
+    gap_ep = meta0["sc"].gap_ep / 1000
+    gap_dev = cons["equipment_spacing"]["gap_mm"] / 1000 if cons["equipment_spacing"]["enabled"] else 0.0
+    # 管道余量只说明管子能压多短，设备还可能先撞上组外的管或设备。行程算起来比余量贵，所以只对排在
+    # 前面的若干切面算，再按修正后的收益重排——否则"余量大但走不动"的切面会一直霸占每轮的名额。
+    # 名额按轴分配。估计收益是"行程 × 会变短的管数"，管多的那个轴会把名额全占掉：实测 X 的切面
+    # 平均让 16 根管变短、Z 只有 10 根，于是 Z 的候选虽然可行、收益也有 +54，却从来排不进名额，
+    # 占地的另一边就一直压不下去。
+    usable = []
+    for ax in axes:
+        same = [t for t in scored if t[3] == ax][:COMPACT_MOVES * COMPACT_LOOKAHEAD]
+        fixed = []
+        for _est, room, shorter, _ax, side, group in same:
+            boxes = [b for nid in group if (b := _node_box(nodes[nid])) is not None]
+            room = min(room, _travel_limit(boxes, _obstacles(inp, group, owner, gap_ep, gap_dev, routes_w), ax, side))
+            if room > COMPACT_MIN_M:
+                fixed.append((room * shorter, room, ax, side, group))
+        fixed.sort(key=lambda t: -t[0])
+        usable += fixed[:COMPACT_MOVES]
+    usable.sort(key=lambda t: -t[0])
     out = []
-    for _est, room, ax, side, group in scored[:COMPACT_MOVES]:
+    for _est, room, ax, side, group in usable:
         for frac in COMPACT_STEPS:
             step = min(room * frac, radius_m)
             if step <= COMPACT_MIN_M:
@@ -567,10 +632,30 @@ def _net_costs(r):
 
 def optimize_scene(inp, settings, log=None):
     """场景优化的对外入口：布管 + 设备平移 / 旋转 / 换口，附下界。输入、设置、结果见 docs/guide.md 第 4 节。
-    log(line) 接收过程日志（可不给）。"""
+    log(line) 接收过程日志（可不给）。
+
+    整串靠拢按轴轮流独占整轮，而**哪个轴先手**对结果影响很大：先手那个轴压完会重布一大片管，
+    后手常常发现机会已经没了。两个轴的估计收益往往接近，事先判断不出该谁先，所以 COMPACT_ORDERS
+    里的每种顺序都跑一遍，按校验器口径的代价取更好的那个；`seconds` 由各趟平分，总时长不变。"""
     log = log or (lambda _l: None)
-    out, final_inp, deltas = _optimize(inp, settings, log)
-    return _attach_bound(out, final_inp, settings, deltas, log)
+    movable = any(n.get("move") for n in inp["nodes"])
+    orders = COMPACT_ORDERS if movable and float(inp.get("radius") or 0) > 0 and len(COMPACT_ORDERS) > 1 else (None,)
+    limit = inp.get("seconds")
+    best = None
+    for i, order in enumerate(orders):
+        one = inp if limit is None or len(orders) == 1 else {**inp, "seconds": float(limit) / len(orders)}
+        tag = "" if order is None else f"[先压轴 {order[0]}] "
+        out, final_inp, deltas = _optimize(one, settings, lambda line: log(tag + line), axes=order)
+        cost = out.get("cost")
+        if order is not None:
+            log(f"{tag}这一趟：{'通过' if out['ok'] else '有违规'}，代价 {cost if cost is not None else '—'}")
+        better = best is None or (out["ok"] and cost is not None
+                                  and (not best[0]["ok"] or best[0]["cost"] is None or cost < best[0]["cost"]))
+        if better:
+            best = (out, final_inp, deltas, order)
+    if len(orders) > 1 and best[3] is not None:
+        log(f"两种先手顺序都跑过，采用先压轴 {best[3][0]} 的结果（代价 {best[0]['cost']}）")
+    return _attach_bound(best[0], best[1], settings, best[2], log)
 
 
 def _attach_bound(out, final_inp, settings, deltas, log):
@@ -671,7 +756,7 @@ def _ev_one(task):
     return k, True, _net_costs(r), {x["id"]: x["points"] for x in _to_web_routes(r["meta"], r["routes"])}
 
 
-def _optimize(inp, settings, log=None):
+def _optimize(inp, settings, log=None, axes=None):
     """布管 + 设备移动 / 旋转 / 换向（局部或全局，范围由输入的 move 标记、候选朝向与 fixed 管决定）。
       1. 按当前姿态重布范围内全部管，得到基准；
       2. 每一轮生成候选（串联拉直、单个对齐、换朝向），并行评估：每个候选只重布与被移动对象相连的管，
@@ -681,6 +766,7 @@ def _optimize(inp, settings, log=None):
       3. 没有改进或到达时间上限后，按最终姿态用完整参数把范围内全部管联合重布一次，取两者中更好的。
     所有比较都用内核自己的指标（校验器口径）；最终是否采用由调用方的校验决定。"""
     log = log or (lambda _l: None)
+    axes = axes or COMPACT_AXES
     t0 = time.time()
     limit = float(inp.get("seconds") or math.inf)
     radius = float(inp.get("radius") or 0)                        # 各轴移动范围（米，场景坐标）
@@ -756,13 +842,18 @@ def _optimize(inp, settings, log=None):
                 log("姿态协商方案未采用：" + (f"代价 {r['cost']:.3f} 不优于 {first['cost']:.3f}" if r["ok"]
                                          else "按正式规则重布有违规：" + "；".join(r["viol"][:3])))
     workers = int(settings["routing"]["route_workers"])
-    pool = None
+    pool, rounds, stale = None, 0, 0
     try:
         while (movable and radius > 0 or rotatable) and time.time() - t0 < limit:
             now = _shifted(_posed(inp, orient), deltas)
+            # 靠拢按轴轮流独占整轮。同轮里两个轴的候选会互相挤：管多的那个轴收益总是更大，而两边的
+            # 设备组大面积重叠、不可能同批接受，于是小的那个轴每轮都排第二，等大的压完机会也没了。
+            axis_now = (axes[rounds % len(axes)],)
+            rounds += 1
             moves = []
             if movable and radius > 0:                             # 先对齐（局部、便宜），再整串靠拢（范围大、按估计收益排序）
-                moves = _candidates(now, info, movable, radius) + _compaction_candidates(now, info, movable, radius, free)
+                moves = (_candidates(now, info, movable, radius)
+                         + _compaction_candidates(now, info, movable, radius, free, routes_w, axis_now))
             cands = [(nm, mv, {}) for nm, mv in moves]
             cands += _rotation_candidates(now, info, rotatable, orient, deltas, settings, settings["rotation_candidates"])
             tasks, meta = [], []
@@ -781,8 +872,11 @@ def _optimize(inp, settings, log=None):
                     if inc:
                         tasks.append((len(tasks), trial, {**orient, **rot}, inc, routes_w))
                         meta.append((name, moved, inc, move, rot))
-            if not tasks:
-                break
+            if not tasks:                                          # 本轮轮到的那个轴可能没有任何候选：换下一个轴再看
+                stale += 1
+                if stale >= len(axes):
+                    break
+                continue
             tried += len(tasks)
             deadline = t0 + limit
             if workers > 1 and len(tasks) >= 4:
@@ -809,8 +903,12 @@ def _optimize(inp, settings, log=None):
                     if gain > 1e-9:
                         good.append((gain, k, new, rw))
             if not good:
+                stale += 1                                         # 轮换时某个轴本轮可能压根没有候选，要把所有轴都试过才算收敛
                 log(f"本轮 {len(results)} 个候选都没有改进（其中可布通 {sum(1 for x in results if x[1])} 个）")
-                break
+                if stale >= len(axes):
+                    break
+                continue
+            stale = 0
             good.sort(key=lambda g: -g[0])
             batch, used_n, used_p = [], set(), set()
             for g in good:                                             # 互不相干的一批
